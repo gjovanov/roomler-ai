@@ -32,6 +32,7 @@
 //! differs. BIND is not supported.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -114,6 +115,17 @@ pub async fn serve_socks5(
     view: watch::Receiver<OverlayView>,
     listener: TcpListener,
 ) {
+    serve_socks5_in(handles, view, listener, crate::forward::flows().clone()).await
+}
+
+/// [`serve_socks5`], listing each CONNECT in `flows` for its life (FR-156 P1:
+/// the process's [`crate::forward::flows`], or a test's own).
+async fn serve_socks5_in(
+    handles: watch::Receiver<Option<NetstackHandle>>,
+    view: watch::Receiver<OverlayView>,
+    listener: TcpListener,
+    flows: crate::liveness::LiveList,
+) {
     loop {
         match listener.accept().await {
             Ok((client, _peer)) => {
@@ -126,8 +138,9 @@ pub async fn serve_socks5(
                 // Snapshot the mesh view so name resolution reflects the netmap
                 // at accept time (cheap: a small Vec of peers).
                 let snapshot = view.borrow().clone();
+                let flows = flows.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(h, snapshot, client).await {
+                    if let Err(e) = handle_connection(h, snapshot, client, &flows).await {
                         debug!(error = %e, "netstack socks: connection ended");
                     }
                 });
@@ -146,10 +159,11 @@ async fn handle_connection(
     handle: NetstackHandle,
     view: OverlayView,
     mut client: TcpStream,
+    flows: &crate::liveness::LiveList,
 ) -> std::io::Result<()> {
     match socks5::accept_request(&mut client).await {
         Ok(Socks5Request::Connect { host, port }) => {
-            connect_and_splice(handle, &view, client, &host, port).await
+            connect_and_splice(handle, &view, client, &host, port, flows).await
         }
         Ok(Socks5Request::UdpAssociate) => handle_udp_associate(handle, view, client).await,
         // `accept_request` already wrote the protocol-level failure reply.
@@ -157,13 +171,16 @@ async fn handle_connection(
     }
 }
 
-/// CONNECT: resolve the target → open a netstack TCP stream → splice.
+/// CONNECT: resolve the target → open a netstack TCP stream → splice. The
+/// splice is a tunnel flow (FR-156 P1): listed in `flows` for its life, and
+/// heard by every read that returns bytes, either way.
 async fn connect_and_splice(
     handle: NetstackHandle,
     view: &OverlayView,
     mut client: TcpStream,
     host: &str,
     port: u16,
+    flows: &crate::liveness::LiveList,
 ) -> std::io::Result<()> {
     let Some(ip) = resolve_overlay_host(view, host) else {
         debug!(%host, "netstack socks: no overlay peer for CONNECT target");
@@ -171,14 +188,20 @@ async fn connect_and_splice(
         return Err(std::io::Error::other("unknown overlay host"));
     };
     let dst = SocketAddr::new(ip, port);
-    let mut upstream = match handle.connect(dst).await {
+    let upstream = match handle.connect(dst).await {
         Ok(s) => s,
         Err(e) => {
             reply(&mut client, REP_HOST_UNREACHABLE).await;
             return Err(e);
         }
     };
+    // Listed before the reply, so an app that has read the success finds its
+    // flow counted; unlisted when this returns or its task is dropped.
+    let listed = flows.join(crate::liveness::Clock::Host);
     reply(&mut client, REP_SUCCESS).await;
+    let stamp = listed.stamp();
+    let mut client = crate::liveness::Heard::new(client, Arc::clone(stamp));
+    let mut upstream = crate::liveness::Heard::new(upstream, Arc::clone(stamp));
     tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .map(|_| ())
@@ -424,6 +447,15 @@ mod tests {
         a_ip: Ipv4Addr,
         b_ip: Ipv4Addr,
     ) -> (Netstack, Netstack, std::net::SocketAddr, impl Sized) {
+        setup_listing(a_ip, b_ip, crate::forward::flows().clone()).await
+    }
+
+    /// [`setup`], listing the front's CONNECTs in `flows`.
+    async fn setup_listing(
+        a_ip: Ipv4Addr,
+        b_ip: Ipv4Addr,
+        flows: crate::liveness::LiveList,
+    ) -> (Netstack, Netstack, std::net::SocketAddr, impl Sized) {
         let a = Netstack::start(a_ip, 24, 1280);
         let b = Netstack::start(b_ip, 24, 1280);
         crosslink(&a, &b);
@@ -443,8 +475,58 @@ mod tests {
             direct_socks: Vec::new(),
             derp_inbound_drops: None,
         });
-        tokio::spawn(serve_socks5(handle_rx, view_rx, socks));
+        tokio::spawn(serve_socks5_in(handle_rx, view_rx, socks, flows));
         (a, b, socks_addr, (handle_tx, view_tx))
+    }
+
+    /// FR-156 T3 — a CONNECT is a tunnel flow: listed for its life, and heard
+    /// by the bytes it moves, either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_socks_front_counts_its_connections() {
+        let a_ip = Ipv4Addr::new(10, 24, 0, 1);
+        let b_ip = Ipv4Addr::new(10, 24, 0, 2);
+        let flows = crate::liveness::LiveList::new();
+        let (_a, b, socks_addr, _keep) = setup_listing(a_ip, b_ip, flows.clone()).await;
+        let mut listener = b.handle.listen(4000).await.unwrap();
+        tokio::spawn(async move {
+            while let Some(s) = listener.accept().await {
+                tokio::spawn(echo(s));
+            }
+        });
+        let _b = b;
+        let ip = b_ip.octets();
+        let by_ip = [ATYP_IPV4, ip[0], ip[1], ip[2], ip[3], 0x0f, 0xa0]; // :4000
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut c = TcpStream::connect(socks_addr).await.unwrap();
+            socks_greet(&mut c).await;
+            let mut req = vec![VER, CMD_CONNECT, 0x00];
+            req.extend_from_slice(&by_ip);
+            c.write_all(&req).await.unwrap();
+            let mut rep = [0u8; 10];
+            c.read_exact(&mut rep).await.unwrap();
+            assert_eq!(rep[1], REP_SUCCESS, "CONNECT must succeed");
+            assert_eq!(flows.len(), 1, "an open CONNECT is not listed");
+
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(flows.heard_within(Duration::from_secs(1)), 0);
+            c.write_all(b"moved").await.unwrap();
+            let mut got = [0u8; 5];
+            c.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"moved");
+            assert_eq!(
+                flows.heard_within(Duration::from_secs(1)),
+                1,
+                "the bytes it moved were not heard"
+            );
+
+            drop(c);
+            while !flows.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the CONNECT is listed for its life, and leaves when it ends");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

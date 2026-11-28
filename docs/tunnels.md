@@ -1032,6 +1032,28 @@ carrier drop), and `tunnel::peer::tests::closing_the_peer_ends_its_live_flows`
 with its exclusion control `a_kept_peer_keeps_its_live_flows`
 (`agents/roomlerd/src/tunnel/peer.rs`).
 
+### An update waits for a flow that moves bytes (FR-156 P1)
+
+An update restarts the daemon, and the restart ends every flow it runs. So a
+flow is live work while it moves bytes: a flow that moved bytes, either way,
+within the last 90 s defers an update as an open SSH connection does
+([installation.md](installation.md#an-update-waits-for-live-work-3429)), and
+one quiet for longer does not, so a forward left open and idle never holds the
+fleet's updates.
+
+- **One list for the process.** Each of the four runners (`run_flow`,
+  `run_flow_quic`, `run_flow_udp_dc`, `run_flow_udp_quic`) lists its flow in
+  `forward::flows()` for as long as it runs, held by a guard that leaves on a
+  return, a panic or an aborted task. The exit side's handlers and the daemon's
+  own forwards and SOCKS5 listeners all run these four; the netstack's SOCKS5
+  front lists each CONNECT the same way.
+- **A stamp beside the byte counts.** The pumps stamp the flow's `FlowStats`
+  where they count bytes read from the app or the peer, before passing them on:
+  one clock read and one relaxed store, no lock.
+- **The clock counts the host's sleep** (`crates/tunnel-core/src/liveness.rs`),
+  so a laptop that slept an hour does not read its last bytes as recent.
+- `ROOMLERD_LIVE_WORK_PROOF=0` counts no flow, as before.
+
 ### ⚠️ The exit never awaits a TURN allocation on its signaling loop (#1761)
 
 An exit agent serves every session of its org from **one** signaling loop
@@ -1662,7 +1684,7 @@ to a running `roomlerd` without any token:
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
 | `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
-| `LiveWork` · `AskForUpdate` | A Mac's update gate (FR-151). `{"t":"live_work"}` answers `{"t":"live_work","d":{…}}`: what an install that restarts this daemon would cut (`rc_sessions`, `ssh_connections`, `exec_runs`, `work` for transfers and recordings, `net_transition`) and `ask_age_secs`, the age of the newest update ask it recorded. The root update helper reads it from both halves before it installs. `{"t":"ask_for_update"}` records the person's own ask ("Apply update", a `roomlerd self-update` run as the person) and answers `{"t":"update_ask_recorded"}`; a daemon that runs as root refuses it. Neither is served on the person socket (`crates/localapi/src/lib.rs:1870`, `:1878`; `person_may`, `:3811`; [installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)) |
+| `LiveWork` · `AskForUpdate` | A Mac's update gate (FR-151). `{"t":"live_work"}` answers `{"t":"live_work","d":{…}}`: what an install that restarts this daemon would cut (`rc_sessions`, `ssh_connections`, `exec_runs`, `work` for transfers and recordings, `tunnel_flows` since FR-156 P1, absent from an older daemon's answer and read as none, `net_transition`) and `ask_age_secs`, the age of the newest update ask it recorded. The root update helper reads it from both halves before it installs. `{"t":"ask_for_update"}` records the person's own ask ("Apply update", a `roomlerd self-update` run as the person) and answers `{"t":"update_ask_recorded"}`; a daemon that runs as root refuses it. Neither is served on the person socket (`crates/localapi/src/lib.rs:1870`, `:1878`; `person_may`, `:3815`; [installation.md](installation.md#macos-the-root-update-helpers-gate-fr-151)) |
 
 ⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
 default 4; `1` is the pre-FR-84 single instance). With one instance, a client that

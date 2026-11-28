@@ -911,13 +911,43 @@ where
         .map(crate::power::ActivityGuard::new);
     // #3429 — and is an SSH connection the periodic update waits for, as the
     // worker's own are: an update stops the service that serves it.
-    let _live = crate::ssh::LiveConnection::open();
+    let live = crate::ssh::LiveConnection::open();
     let asker = services.asker.clone();
-    splice_framed(client, pipe, peer, move |ask| {
-        let asker = asker.clone();
-        async move { answer_here(ask, &asker).await }
-    })
+    carry_over(
+        client,
+        pipe,
+        peer,
+        move |ask| {
+            let asker = asker.clone();
+            async move { answer_here(ask, &asker).await }
+        },
+        live,
+    )
     .await
+}
+
+/// [`carry`] once the pipe is open: splice `client` into `pipe`, with `live`
+/// counting the connection for as long as it runs. FR-156 P1: the client is
+/// heard by every read of its bytes, as the worker's own server hears its
+/// clients; the service's keepalives draw those bytes from a quiet one.
+#[cfg(all(windows, feature = "ssh-server"))]
+async fn carry_over<C, P, A, AFut>(
+    client: C,
+    pipe: P,
+    peer: std::net::SocketAddr,
+    answer: A,
+    live: crate::ssh::LiveConnection,
+) -> Result<(), String>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: Fn(ConsentAsk) -> AFut + Send + Sync + 'static,
+    AFut: Future<Output = ConsentAnswer> + Send + 'static,
+{
+    // The client's side is the one heard: the SYSTEM service's keepalives
+    // and its output prove nothing of the client's life, its answers do.
+    let client = live.heard(client);
+    splice_framed(client, pipe, peer, answer).await
 }
 
 /// The person's answer to a question the service relayed, asked here as the
@@ -1242,6 +1272,72 @@ mod tests {
         assert_eq!(echoed, payload);
         assert!(serving.await.unwrap().is_ok());
         assert!(splicing.await.unwrap().is_ok());
+    }
+
+    /// FR-156 S4 — the carry to the SYSTEM service is heard by its client's
+    /// bytes, as the worker's own server is: what the service sends the
+    /// client proves nothing of the client, and what the client sends is
+    /// heard as it passes. The carry leaves the registry when it ends.
+    #[cfg(all(windows, feature = "ssh-server"))]
+    #[tokio::test(start_paused = true)]
+    async fn the_carry_stamps_the_clients_bytes() {
+        use tunnel_core::liveness::{Clock, LiveList};
+        let registry = LiveList::new();
+        let live = crate::ssh::LiveConnection::open_in(&registry, Clock::tokio());
+        let stamp = Arc::clone(live.stamp());
+        let (mut service, worker_pipe) = tokio::io::duplex(4 * MAX_DATA);
+        let (mut client, carried) = tokio::io::duplex(4 * MAX_DATA);
+        let carrying = tokio::spawn(carry_over(
+            carried,
+            worker_pipe,
+            "100.64.0.9:5000".parse().unwrap(),
+            |ask: ConsentAsk| async move {
+                ConsentAnswer {
+                    id: ask.id,
+                    granted: false,
+                    reason: None,
+                }
+            },
+            live,
+        ));
+        assert!(matches!(
+            read_frame(&mut service).await.unwrap(),
+            Some(Frame::Hello(_))
+        ));
+        assert_eq!(registry.len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        write_frame(&mut service, &Frame::Data(b"from the service".to_vec()))
+            .await
+            .unwrap();
+        let mut got = [0u8; 16];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"from the service");
+        assert_eq!(
+            stamp.age(),
+            Duration::from_secs(60),
+            "the service's bytes were heard as the client's"
+        );
+
+        client.write_all(b"from the client").await.unwrap();
+        let mut carried_bytes = Vec::new();
+        while carried_bytes.len() < b"from the client".len() {
+            match read_frame(&mut service).await.unwrap() {
+                Some(Frame::Data(d)) => carried_bytes.extend_from_slice(&d),
+                other => panic!("expected the client's bytes, got {other:?}"),
+            }
+        }
+        assert_eq!(carried_bytes, b"from the client");
+        assert_eq!(
+            stamp.age(),
+            Duration::ZERO,
+            "the client's bytes were not heard"
+        );
+
+        drop(client);
+        drop(service);
+        let _ = carrying.await;
+        assert!(registry.is_empty(), "an ended carry stayed listed");
     }
 
     #[test]

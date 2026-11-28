@@ -1847,13 +1847,13 @@ jobs:
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" macos_kernel_tests \
             --test-threads=1 --nocapture
 
-      - name: The route monitor's supervisor on macOS (#4382)
-        # #1867's respawn and #4382's stop cells run on Linux in rust-agent's
-        # tunnel-core step. The step above runs only the utun tests, so on a
-        # Mac, the platform of `route -n monitor`, nothing ran them. The same
-        # build as the step above, run as the normal user: the cells start
-        # `sh` stand-ins, never `route`.
-        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib -- monitor_child --test-threads=1 --nocapture
+      - name: The route monitor's supervisor (#4382) and the liveness clock (FR-156) on macOS
+        # #1867's respawn and #4382's stop cells, and FR-156's C1 (the clock a liveness age
+        # reads counts the host's sleep), run on Linux in rust-agent's tunnel-core step. The
+        # step above runs only the utun tests, so on a Mac, the platform of `route -n monitor`
+        # and of CLOCK_MONOTONIC's sleep, nothing ran them. The same build as the step above,
+        # run as the normal user: the cells start `sh` stand-ins, never `route`.
+        run: cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib -- monitor_child liveness::tests --test-threads=1 --nocapture
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

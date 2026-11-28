@@ -154,9 +154,30 @@ pub struct FlowStats {
     /// count is the true application payload — comparable across
     /// WebRTC (which adds a 4-byte frame prefix) and QUIC.
     pub session: Option<Arc<SessionThroughput>>,
+    /// FR-156 P1 — when the counters last moved, either way: touched by the
+    /// pumps beside their adds ([`FlowStats::moved`]), and listed in
+    /// [`flows`] for the runner's life. Heard when the flow is made.
+    pub moved_at: Arc<crate::liveness::Stamp>,
+}
+
+/// FR-156 P1 — the flows that run in this process: the exit side's handlers,
+/// and this daemon's own forwards and SOCKS5 listeners, which run the same
+/// four runners. Each is listed for its runner's life
+/// ([`crate::liveness::Listed`]), and the update gate counts those that moved
+/// bytes within [`crate::liveness::WINDOW`].
+pub fn flows() -> &'static crate::liveness::LiveList {
+    static FLOWS: std::sync::LazyLock<crate::liveness::LiveList> =
+        std::sync::LazyLock::new(crate::liveness::LiveList::new);
+    &FLOWS
 }
 
 impl FlowStats {
+    /// FR-156 P1 — bytes moved now: one clock read and one relaxed store.
+    #[inline]
+    pub fn moved(&self) {
+        self.moved_at.touch();
+    }
+
     /// `(tcp_read, dc_send, dc_recv, tcp_write, mailbox_depth)` —
     /// relaxed snapshot.
     pub fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
@@ -396,6 +417,7 @@ impl FlowDemux {
                 stats
                     .dc_recv_bytes
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                stats.moved();
                 if let Err(e) = tx.send(Bytes::copy_from_slice(payload)).await {
                     debug!(flow_id, %e, "tunnel flow mailbox closed; dropping payload");
                 }
@@ -590,6 +612,8 @@ pub async fn run_flow(
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
     let _gauge = stats.session.clone().map(FlowGauge::new);
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     // Set the DC's low-water threshold once. `on_buffered_amount_low`
     // fires whenever the SCTP send queue drops back to or below this
     // value — i.e. when we have room to push more.
@@ -755,6 +779,8 @@ pub async fn run_flow_quic(
     // P3b-3: hold an `active_flows` gauge for this flow's pump lifetime
     // (no-op when not session-tracked). Drops on return AND on abort.
     let _gauge = stats.session.clone().map(FlowGauge::new);
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     let (mut read_half, mut write_half) = tcp.into_split();
     let logger_handle = spawn_flow_logger(flow_id, Arc::clone(&stats));
 
@@ -773,6 +799,7 @@ pub async fn run_flow_quic(
                     stats_send
                         .tcp_read_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    stats_send.moved();
                     stats_send.add_session_out(n as u64);
                     if let Err(e) = send.write_all(&buf[..n]).await {
                         debug!(flow_id, %e, "quic pump: stream write error");
@@ -804,6 +831,7 @@ pub async fn run_flow_quic(
                     stats_recv
                         .dc_recv_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    stats_recv.moved();
                     if let Err(e) = write_half.write_all(&buf[..n]).await {
                         debug!(flow_id, %e, "quic pump: TCP write error");
                         return CloseReason::IoError;
@@ -959,6 +987,8 @@ pub async fn run_flow_udp_dc(
     idle_timeout: std::time::Duration,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
     loop {
         tokio::select! {
@@ -967,6 +997,7 @@ pub async fn run_flow_udp_dc(
                 Some(framed) => {
                     if let Some(dg) = deframe_udp_datagram(&framed) {
                         stats.dc_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
+                        stats.moved();
                         match udp.send(dg).await {
                             Ok(_) => { stats.tcp_write_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed); }
                             Err(e) => debug!(flow_id, %e, "udp pump: send to target failed"),
@@ -981,6 +1012,7 @@ pub async fn run_flow_udp_dc(
             r = udp.recv(&mut buf) => match r {
                 Ok(n) => {
                     stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    stats.moved();
                     if let Some(framed) = frame_udp_datagram(&buf[..n]) {
                         if let Err(e) = dc.send(&Bytes::from(mux::encode(flow_id, &framed))).await {
                             debug!(flow_id, %e, "udp pump: DC send failed");
@@ -1013,12 +1045,15 @@ pub async fn run_flow_udp_quic(
     idle_timeout: std::time::Duration,
     stats: Arc<FlowStats>,
 ) -> CloseReason {
+    // FR-156 P1: listed in the process's flows for as long as this runs.
+    let _listed = flows().list(Arc::clone(&stats.moved_at));
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
     loop {
         tokio::select! {
             r = quic_read_datagram(&mut recv) => match r {
                 Ok(Some(dg)) => {
                     stats.dc_recv_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed);
+                    stats.moved();
                     match udp.send(&dg).await {
                         Ok(_) => { stats.tcp_write_bytes.fetch_add(dg.len() as u64, Ordering::Relaxed); }
                         Err(e) => debug!(flow_id, %e, "udp pump: send to target failed"),
@@ -1033,6 +1068,7 @@ pub async fn run_flow_udp_quic(
             r = udp.recv(&mut buf) => match r {
                 Ok(n) => {
                     stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    stats.moved();
                     if let Err(e) = quic_write_datagram(&mut send, &buf[..n]).await {
                         debug!(flow_id, %e, "udp pump: quic write failed");
                         return CloseReason::IoError;
@@ -1147,6 +1183,7 @@ async fn pump_tcp_to_dc(
             }
         };
         stats.tcp_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        stats.moved();
         stats.add_session_out(n as u64);
 
         let framed = mux::encode(flow_id, &buf[..n]);
@@ -1799,5 +1836,311 @@ mod tests {
             "echoed datagram must round-trip through the UDP pump"
         );
         pump.abort();
+    }
+
+    // ── FR-156 P1: a flow counts while it moves bytes ──────────────────────
+
+    fn loopback() -> std::net::SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// A QUIC connection over loopback, both ends, with the endpoints that
+    /// carry it (kept for the test's life).
+    async fn quic_pair() -> (
+        quinn::Connection,
+        quinn::Connection,
+        (
+            crate::transport::quic::QuicPeer,
+            crate::transport::quic::QuicPeer,
+        ),
+    ) {
+        use crate::transport::quic::QuicPeer;
+        let (server, fp) = QuicPeer::server(loopback()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = QuicPeer::client(loopback(), &fp).unwrap();
+        let accepting = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            (conn, server)
+        });
+        let client_conn = client.connect(server_addr).await.unwrap();
+        let (agent_conn, server) = accepting.await.unwrap();
+        (client_conn, agent_conn, (client, server))
+    }
+
+    /// A connected TCP pair over loopback.
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let near = TcpStream::connect(addr).await.unwrap();
+        let (far, _) = listener.accept().await.unwrap();
+        (near, far)
+    }
+
+    /// A UDP socket connected to a loopback target nobody reads.
+    async fn udp_to_nowhere() -> (tokio::net::UdpSocket, tokio::net::UdpSocket) {
+        let target = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+        let udp = tokio::net::UdpSocket::bind(loopback()).await.unwrap();
+        udp.connect(target.local_addr().unwrap()).await.unwrap();
+        (udp, target)
+    }
+
+    /// Wait up to 5 s for `stamp` to be listed in [`flows`], or not.
+    async fn listed_within(stamp: &Arc<crate::liveness::Stamp>, want: bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if flows().contains(stamp) == want {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// FR-156 T1 — a flow counts while it moved bytes within the window: a
+    /// stamp 30 s old counts and one 91 s old does not, and moving bytes
+    /// again makes it count. A runner that finishes, and one whose task is
+    /// aborted, leaves the process's list.
+    #[test]
+    fn a_flow_that_moved_bytes_in_the_window_counts() {
+        use crate::liveness::{Clock, LiveList, WINDOW};
+        let paused = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        paused.block_on(async {
+            let list = LiveList::new();
+            let old = list.join(Clock::tokio());
+            tokio::time::advance(Duration::from_secs(61)).await;
+            let recent = list.join(Clock::tokio());
+            tokio::time::advance(Duration::from_secs(30)).await;
+            assert_eq!(old.stamp().age(), Duration::from_secs(91));
+            assert_eq!(recent.stamp().age(), Duration::from_secs(30));
+            assert_eq!(list.heard_within(WINDOW), 1, "a stamp 91 s old counted");
+            old.stamp().touch();
+            assert_eq!(
+                list.heard_within(WINDOW),
+                2,
+                "bytes moved now did not count"
+            );
+        });
+
+        let real = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        real.block_on(async {
+            let (client_conn, agent_conn, _endpoints) = quic_pair().await;
+
+            // Finished: a UDP flow that goes quiet ends at its idle timeout.
+            let (c_send, _c_recv) = crate::transport::quic::open_flow(&client_conn, 7)
+                .await
+                .unwrap();
+            let (_, a_send, a_recv) = crate::transport::quic::accept_flow(&agent_conn)
+                .await
+                .unwrap();
+            let (udp, _target) = udp_to_nowhere().await;
+            let stats = Arc::new(FlowStats::default());
+            let stamp = Arc::clone(&stats.moved_at);
+            let runner = tokio::spawn(run_flow_udp_quic(
+                udp,
+                a_send,
+                a_recv,
+                7,
+                Duration::from_millis(500),
+                stats,
+            ));
+            assert!(
+                listed_within(&stamp, true).await,
+                "a running flow is absent from the list"
+            );
+            let reason = runner.await.unwrap();
+            assert!(matches!(reason, CloseReason::IdleTimeout), "{reason:?}");
+            assert!(
+                !flows().contains(&stamp),
+                "a finished flow stayed in the list"
+            );
+            drop(c_send);
+
+            // Aborted: an idle TCP flow, its task aborted.
+            let (c_send, c_recv) = crate::transport::quic::open_flow(&client_conn, 8)
+                .await
+                .unwrap();
+            let (_, a_send, a_recv) = crate::transport::quic::accept_flow(&agent_conn)
+                .await
+                .unwrap();
+            let (into_tunnel, _app) = tcp_pair().await;
+            let stats = Arc::new(FlowStats::default());
+            let stamp = Arc::clone(&stats.moved_at);
+            let runner = tokio::spawn(run_flow_quic(into_tunnel, a_send, a_recv, 8, stats));
+            assert!(
+                listed_within(&stamp, true).await,
+                "a running flow is absent from the list"
+            );
+            runner.abort();
+            assert!(runner.await.unwrap_err().is_cancelled());
+            assert!(
+                !flows().contains(&stamp),
+                "an aborted flow stayed in the list"
+            );
+            drop((c_send, c_recv));
+            client_conn.close(0u32.into(), b"done");
+            agent_conn.close(0u32.into(), b"done");
+        });
+    }
+
+    /// FR-156 T2 — each of the four runners lists its flow while it runs and
+    /// takes it out when it ends, and stamps it as bytes move. The exit side's
+    /// handlers and the daemon's own forwards and SOCKS5 listeners run these
+    /// four and no other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_runner_joins_the_list() {
+        // run_flow: a DC pool, both ends, ended by the session's cancel.
+        let offerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer = TunnelPeer::new(vec![]).await.unwrap();
+        let answerer_pc = answerer.peer_connection();
+        offerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&answerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offerer_pc = offerer.peer_connection();
+        answerer.on_local_ice_candidate(move |c| {
+            let pc = Arc::clone(&offerer_pc);
+            Box::pin(async move {
+                if let Some(c) = c
+                    && let Ok(init) = c.to_json()
+                {
+                    let _ = pc.add_ice_candidate(init).await;
+                }
+            })
+        });
+        let offer = offerer.create_offer().await.unwrap();
+        let answer = answerer.accept_offer(&offer.sdp).await.unwrap();
+        offerer.accept_answer(&answer.sdp).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), offerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), answerer.wait_pool_open())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let client_demux = FlowDemux::install(offerer.dc(0).unwrap(), None).await;
+        let (client_from_dc, client_stats) = client_demux.register(1).await;
+        let exit_demux = FlowDemux::install(answerer.dc(0).unwrap(), None).await;
+        let (exit_from_dc, exit_stats) = exit_demux.register(1).await;
+        let (client_stamp, exit_stamp) = (
+            Arc::clone(&client_stats.moved_at),
+            Arc::clone(&exit_stats.moved_at),
+        );
+        let (client_tcp, mut app) = tcp_pair().await;
+        let (exit_tcp, mut target) = tcp_pair().await;
+        let cancel = FlowCanceller::new();
+        let noop: HalfCloseSink = Arc::new(|_fid: u32| {});
+        let client_flow = tokio::spawn(run_flow(
+            client_tcp,
+            offerer.dc(0).unwrap(),
+            1,
+            client_from_dc,
+            noop.clone(),
+            client_stats,
+            cancel.handle(),
+        ));
+        let exit_flow = tokio::spawn(run_flow(
+            exit_tcp,
+            answerer.dc(0).unwrap(),
+            1,
+            exit_from_dc,
+            noop,
+            exit_stats,
+            cancel.handle(),
+        ));
+        assert!(listed_within(&client_stamp, true).await, "run_flow, client");
+        assert!(listed_within(&exit_stamp, true).await, "run_flow, exit");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        app.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        target.read_exact(&mut got).await.unwrap();
+        assert!(
+            client_stamp.age() < Duration::from_secs(1)
+                && exit_stamp.age() < Duration::from_secs(1),
+            "run_flow moved bytes and stamped nothing: {:?} {:?}",
+            client_stamp.age(),
+            exit_stamp.age()
+        );
+        cancel.cancel();
+        client_flow.await.unwrap();
+        exit_flow.await.unwrap();
+        assert!(!flows().contains(&client_stamp) && !flows().contains(&exit_stamp));
+
+        // run_flow_udp_dc: on the same pool, aborted.
+        let (agent_from_dc, stats) = exit_demux.register(2).await;
+        let (udp, _target) = udp_to_nowhere().await;
+        let stamp = Arc::clone(&stats.moved_at);
+        let udp_dc = tokio::spawn(run_flow_udp_dc(
+            udp,
+            answerer.dc(0).unwrap(),
+            2,
+            agent_from_dc,
+            Duration::from_secs(30),
+            stats,
+        ));
+        assert!(listed_within(&stamp, true).await, "run_flow_udp_dc");
+        udp_dc.abort();
+        let _ = udp_dc.await;
+        assert!(!flows().contains(&stamp), "run_flow_udp_dc left no entry");
+        offerer.close().await;
+        answerer.close().await;
+
+        // run_flow_quic and run_flow_udp_quic.
+        let (client_conn, agent_conn, _endpoints) = quic_pair().await;
+        let (_c_send, _c_recv) = crate::transport::quic::open_flow(&client_conn, 3)
+            .await
+            .unwrap();
+        let (_, a_send, a_recv) = crate::transport::quic::accept_flow(&agent_conn)
+            .await
+            .unwrap();
+        let (into_tunnel, _app) = tcp_pair().await;
+        let stats = Arc::new(FlowStats::default());
+        let stamp = Arc::clone(&stats.moved_at);
+        let quic = tokio::spawn(run_flow_quic(into_tunnel, a_send, a_recv, 3, stats));
+        assert!(listed_within(&stamp, true).await, "run_flow_quic");
+        quic.abort();
+        let _ = quic.await;
+        assert!(!flows().contains(&stamp), "run_flow_quic left no entry");
+
+        let (_c_send, _c_recv) = crate::transport::quic::open_flow(&client_conn, 4)
+            .await
+            .unwrap();
+        let (_, a_send, a_recv) = crate::transport::quic::accept_flow(&agent_conn)
+            .await
+            .unwrap();
+        let (udp, _target) = udp_to_nowhere().await;
+        let stats = Arc::new(FlowStats::default());
+        let stamp = Arc::clone(&stats.moved_at);
+        let udp_quic = tokio::spawn(run_flow_udp_quic(
+            udp,
+            a_send,
+            a_recv,
+            4,
+            Duration::from_secs(30),
+            stats,
+        ));
+        assert!(listed_within(&stamp, true).await, "run_flow_udp_quic");
+        udp_quic.abort();
+        let _ = udp_quic.await;
+        assert!(!flows().contains(&stamp), "run_flow_udp_quic left no entry");
+        client_conn.close(0u32.into(), b"done");
+        agent_conn.close(0u32.into(), b"done");
     }
 }

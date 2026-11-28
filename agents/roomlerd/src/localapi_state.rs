@@ -1173,6 +1173,7 @@ impl LocalApiState for DaemonState {
             ssh_connections: count(busy.ssh_connections),
             exec_runs: count(busy.exec_runs),
             work: count(busy.work),
+            tunnel_flows: count(busy.tunnel_flows),
             net_transition: busy.net_transition,
             ask_age_secs: self.asks.age_secs(std::time::SystemTime::now()),
         })

@@ -620,6 +620,29 @@ mod sshd {
     /// small enough that a runaway client cannot exhaust the device's fds.
     pub(super) const MAX_CONCURRENT_FORWARDS: usize = 64;
 
+    /// FR-156 P1 (D1) — how often the server asks a quiet client whether it
+    /// is there (`keepalive@openssh.com`). Three unanswered in a row is the
+    /// liveness window, so a connection whose client stopped answering stops
+    /// counting as live work.
+    pub(super) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+    const _: () = assert!(
+        3 * KEEPALIVE_INTERVAL.as_secs() == tunnel_core::liveness::WINDOW.as_secs(),
+        "the liveness window is three keepalives"
+    );
+
+    /// FR-156 P1 — both servers' keepalives, with `proof` on: one every
+    /// [`KEEPALIVE_INTERVAL`] of the client's silence, and never a close for
+    /// want of an answer (`keepalive_max: 0`), so the connection's own
+    /// timeouts still decide when it ends. Any packet back from the client
+    /// is heard ([`tunnel_core::liveness::Heard`]). With `proof` off
+    /// (`ROOMLERD_LIVE_WORK_PROOF=0`), russh's defaults as before: none.
+    pub(super) fn keep_alive(config: &mut russh::server::Config, proof: bool) {
+        if proof {
+            config.keepalive_interval = Some(KEEPALIVE_INTERVAL);
+            config.keepalive_max = 0;
+        }
+    }
+
     impl Ctx {
         /// Returns `None` when the node has no usable host key — the caller
         /// then serves nothing, which is the right failure: an SSH endpoint
@@ -660,7 +683,7 @@ mod sshd {
                 None => {}
             }
 
-            let config = russh::server::Config {
+            let mut config = russh::server::Config {
                 // A session left open by a dropped carrier should not pin
                 // resources forever; ten minutes of silence ends it.
                 inactivity_timeout: Some(Duration::from_secs(600)),
@@ -670,6 +693,7 @@ mod sshd {
                 keys: vec![host_key],
                 ..Default::default()
             };
+            keep_alive(&mut config, tunnel_core::liveness::proof());
 
             // Resolve the key-list identity ONCE, here, so a missing or
             // malformed `ssh_account_mode` is a start-up log line rather than
@@ -747,7 +771,7 @@ mod sshd {
                 .public_key()
                 .fingerprint(ssh_key::HashAlg::Sha256)
                 .to_string();
-            let config = russh::server::Config {
+            let mut config = russh::server::Config {
                 // The worker's values: an abandoned session ends after ten
                 // minutes of silence, and guessing is slowed.
                 inactivity_timeout: Some(Duration::from_secs(600)),
@@ -756,6 +780,7 @@ mod sshd {
                 keys: vec![host_key],
                 ..Default::default()
             };
+            keep_alive(&mut config, tunnel_core::liveness::proof());
             info!(%fingerprint, ?ceiling, "ssh-service: serving a connection");
             Some(Arc::new(Self {
                 config: Arc::new(config),
@@ -3083,7 +3108,24 @@ async fn serve_conn(stream: tunnel_core::overlay::netstack::NsTcpStream, ctx: Se
     };
 
     info!(%peer, "ssh: session opening");
-    let _live = LiveConnection::open();
+    serve_stream(stream, peer, ctx, LiveConnection::open()).await
+}
+
+/// Serve the SSH protocol over `stream`, a connection `live` counts for as
+/// long as this runs, however it ends (FR-156 P1: a return, a panic, or an
+/// aborted task).
+#[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
+async fn serve_stream<S>(
+    stream: S,
+    peer: std::net::SocketAddr,
+    ctx: std::sync::Arc<sshd::Ctx>,
+    live: LiveConnection,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tracing::info;
+
+    let stream = live.heard(stream);
     let handler = sshd::Handler::new(ctx.clone(), peer);
     match russh::server::run_stream(ctx.config.clone(), stream, handler).await {
         Ok(session) => match session.await {
@@ -3132,33 +3174,61 @@ pub async fn serve_for_service<S>(
 
 /// FR-96 P2b, #3429 — SSH connections open on this device right now. A
 /// restart ends every one of them, so the restart onto a replaced binary and
-/// the periodic update wait while any is open: the likeliest way a binary gets
+/// the periodic update wait while any is live: the likeliest way a binary gets
 /// replaced is an admin's `apt upgrade` typed INTO one of these sessions.
-static LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// How many SSH connections are open right now; zero in a build without the
-/// SSH server.
-pub fn live_connections() -> usize {
-    LIVE_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+///
+/// FR-156 P1 — each with the time its client was last heard: the transport
+/// stamps every read that returns bytes, and the server's keepalive draws a
+/// packet from a quiet client every 30 s. A connection whose client stopped
+/// answering stays open until its own timeouts end it, but stops counting.
+fn connections() -> &'static tunnel_core::liveness::LiveList {
+    static CONNECTIONS: std::sync::LazyLock<tunnel_core::liveness::LiveList> =
+        std::sync::LazyLock::new(tunnel_core::liveness::LiveList::new);
+    &CONNECTIONS
 }
 
-/// Counts one connection in [`LIVE_CONNECTIONS`] for as long as it lives,
-/// whichever way `serve_conn`, or the carry to the SYSTEM service, returns.
+/// How many SSH connections a restart would cut now: those whose client was
+/// heard within the liveness window ([`crate::busy::ssh_counted`]); zero in
+/// a build without the SSH server.
+pub fn live_connections() -> usize {
+    crate::busy::ssh_counted(connections(), tunnel_core::liveness::proof())
+}
+
+/// Lists one connection in the registry for as long as it lives, whichever
+/// way `serve_conn`, or the carry to the SYSTEM service, returns: the entry
+/// leaves with this guard, on a close, an error, a panic or an aborted task.
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
-pub(crate) struct LiveConnection;
+pub(crate) struct LiveConnection {
+    _listed: tunnel_core::liveness::Listed,
+}
 
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
 impl LiveConnection {
+    /// A connection in this process's registry, heard now.
     pub(crate) fn open() -> Self {
-        LIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
+        Self::open_in(connections(), tunnel_core::liveness::Clock::Host)
     }
-}
 
-#[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
-impl Drop for LiveConnection {
-    fn drop(&mut self) {
-        LIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    /// A connection in `list`, on `clock`: the process's, or a test's own.
+    pub(crate) fn open_in(
+        list: &tunnel_core::liveness::LiveList,
+        clock: tunnel_core::liveness::Clock,
+    ) -> Self {
+        Self {
+            _listed: list.join(clock),
+        }
+    }
+
+    /// `stream`, with every read that returns bytes heard as this
+    /// connection's client: a keepalive's answer as much as a keystroke.
+    pub(crate) fn heard<S>(&self, stream: S) -> tunnel_core::liveness::Heard<S> {
+        tunnel_core::liveness::Heard::new(stream, std::sync::Arc::clone(self._listed.stamp()))
+    }
+
+    /// When its client was last heard.
+    #[cfg(test)]
+    pub(crate) fn stamp(&self) -> &std::sync::Arc<tunnel_core::liveness::Stamp> {
+        self._listed.stamp()
     }
 }
 
@@ -3788,8 +3858,20 @@ mod tests {
         key: PrivateKey,
         config: russh::client::Config,
     ) -> russh::client::Handle<TestClient> {
-        let config = Arc::new(config);
         let stream = TcpStream::connect(addr).await.unwrap();
+        sign_in(stream, key, config).await
+    }
+
+    /// Sign in with `key` over `stream`, as a client configured with `config`.
+    async fn sign_in<S>(
+        stream: S,
+        key: PrivateKey,
+        config: russh::client::Config,
+    ) -> russh::client::Handle<TestClient>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let config = Arc::new(config);
         let mut session = russh::client::connect_stream(config, stream, TestClient)
             .await
             .expect("ssh handshake");
@@ -7557,6 +7639,219 @@ mod tests {
             "{log}"
         );
         assert!(log.contains("authorized_keys=1"), "{log}");
+    }
+
+    // ── FR-156 P1: a connection counts while its client is heard ───────────
+
+    /// A client's transport that, once `muted`, swallows everything the
+    /// client sends: a client that stopped answering, its connection open.
+    struct Muted {
+        inner: tokio::io::DuplexStream,
+        muted: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for Muted {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Muted {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.muted.load(std::sync::atomic::Ordering::Relaxed) {
+                return std::task::Poll::Ready(Ok(buf.len()));
+            }
+            std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// One signed-in key-list connection over an in-memory pipe, served by
+    /// the worker's server (`Ctx::build`) the way `serve_conn` serves one,
+    /// and listed in a test's own registry on tokio's clock (paused in these
+    /// cells).
+    struct OneConnection {
+        client: russh::client::Handle<TestClient>,
+        server: tokio::task::JoinHandle<()>,
+        registry: tunnel_core::liveness::LiveList,
+        stamp: Arc<tunnel_core::liveness::Stamp>,
+        muted: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn one_connection() -> OneConnection {
+        let (key, line) = client_key(61);
+        let ctx = super::sshd::Ctx::build(&cfg_with(vec![line]), test_services())
+            .expect("a usable host key");
+        let registry = tunnel_core::liveness::LiveList::new();
+        let live = super::LiveConnection::open_in(&registry, tunnel_core::liveness::Clock::tokio());
+        let stamp = Arc::clone(live.stamp());
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let peer: std::net::SocketAddr = "127.0.0.1:2222".parse().unwrap();
+        let server = tokio::spawn(super::serve_stream(server_end, peer, ctx, live));
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Muted {
+            inner: client_end,
+            muted: Arc::clone(&muted),
+        };
+        let client = sign_in(transport, key, russh::client::Config::default()).await;
+        OneConnection {
+            client,
+            server,
+            registry,
+            stamp,
+            muted,
+        }
+    }
+
+    /// FR-156 S1 — a connection whose client stopped answering counts until
+    /// it was last heard more than 90 s ago, then stops counting though it
+    /// stays open: the server keeps asking, never closes for want of an
+    /// answer, and its own inactivity timeout (600 s) still ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_answering_stops_counting() {
+        use std::time::Duration;
+        let c = one_connection().await;
+        let heard = tokio::time::Instant::now();
+        c.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+        let counted = || crate::busy::ssh_counted(&c.registry, true);
+
+        tokio::time::sleep_until(heard + Duration::from_secs(89)).await;
+        assert_eq!(counted(), 1, "a client heard 89 s ago did not count");
+        tokio::time::sleep_until(heard + Duration::from_secs(91)).await;
+        assert_eq!(counted(), 0, "a client silent for 91 s still counted");
+        tokio::time::sleep_until(heard + Duration::from_secs(120)).await;
+        assert!(
+            !c.server.is_finished(),
+            "an unanswered keepalive closed the connection"
+        );
+        assert_eq!(c.registry.len(), 1, "the open connection left the registry");
+        tokio::time::sleep_until(heard + Duration::from_secs(601)).await;
+        assert!(
+            c.server.is_finished(),
+            "the inactivity timeout no longer ends a silent connection"
+        );
+        assert!(c.registry.is_empty(), "an ended connection stayed listed");
+        drop(c.client);
+    }
+
+    /// FR-156 S2 (D5) — an idle connection whose client answers the server's
+    /// keepalives is heard every 30 s, counts every minute, and stays open
+    /// past the 600 s inactivity timeout.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_client_that_answers_keeps_counting() {
+        use std::time::Duration;
+        let c = one_connection().await;
+        let start = tokio::time::Instant::now();
+        for minute in 1..=11u64 {
+            tokio::time::sleep_until(start + Duration::from_secs(60 * minute)).await;
+            assert!(
+                c.stamp.age() <= Duration::from_secs(31),
+                "minute {minute}: the client was last heard {:?} ago",
+                c.stamp.age()
+            );
+            assert_eq!(
+                crate::busy::ssh_counted(&c.registry, true),
+                1,
+                "minute {minute}"
+            );
+        }
+        assert!(
+            !c.server.is_finished(),
+            "an idle connection whose client answers was closed"
+        );
+        drop(c.client);
+    }
+
+    /// FR-156 S3 (D1) — both servers, the worker's and the SYSTEM service's,
+    /// ask a quiet client every 30 s and never close for want of an answer,
+    /// and the inactivity timeout stays 600 s. With the switch off, russh's
+    /// defaults as before: no keepalive.
+    #[test]
+    fn both_configs_keep_alive_and_never_close_on_it() {
+        use std::time::Duration;
+        let worker =
+            super::sshd::Ctx::build(&cfg_with(vec![]), test_services()).expect("a usable host key");
+        let pem = super::generate_host_key().unwrap();
+        let service = super::sshd::Ctx::for_service(
+            &pem,
+            roomler_ai_remote_control::models::SshServiceCeiling::System,
+            test_services(),
+        )
+        .expect("a usable host key");
+        for (name, config) in [("worker", &worker.config), ("service", &service.config)] {
+            assert_eq!(
+                config.keepalive_interval,
+                Some(Duration::from_secs(30)),
+                "{name}"
+            );
+            assert_eq!(config.keepalive_max, 0, "{name}");
+            assert_eq!(
+                config.inactivity_timeout,
+                Some(Duration::from_secs(600)),
+                "{name}"
+            );
+        }
+
+        let mut off = russh::server::Config::default();
+        super::sshd::keep_alive(&mut off, false);
+        let before = russh::server::Config::default();
+        assert_eq!(off.keepalive_interval, before.keepalive_interval);
+        assert_eq!(off.keepalive_max, before.keepalive_max);
+        assert_eq!(off.inactivity_timeout, before.inactivity_timeout);
+    }
+
+    /// FR-156 — a connection leaves the registry however its task ends: the
+    /// client's close, or the task aborted.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_leaves_the_registry_however_it_ends() {
+        use std::time::Duration;
+        let c = one_connection().await;
+        assert_eq!(c.registry.len(), 1);
+        c.client
+            .disconnect(russh::Disconnect::ByApplication, "done", "")
+            .await
+            .unwrap();
+        drop(c.client);
+        tokio::time::timeout(Duration::from_secs(5), c.server)
+            .await
+            .expect("the server ends with its client")
+            .unwrap();
+        assert!(
+            c.registry.is_empty(),
+            "a closed connection stayed in the registry"
+        );
+
+        let c = one_connection().await;
+        assert_eq!(c.registry.len(), 1);
+        c.server.abort();
+        assert!(c.server.await.unwrap_err().is_cancelled());
+        assert!(
+            c.registry.is_empty(),
+            "an aborted connection stayed in the registry"
+        );
+        drop(c.client);
     }
 }
 
