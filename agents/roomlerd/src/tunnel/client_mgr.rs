@@ -763,7 +763,8 @@ impl TunnelClientHub {
 }
 
 /// RAII guard: clears the hub's published sink to `None` on drop (every
-/// `connect_once` exit path), so a supervisor holding the dead egress re-waits.
+/// `connect_once` exit path), so a supervisor holding the dead egress re-waits,
+/// and ends the quic-v1 session each flow runs (FR-158 P1b).
 pub struct SinkGuard {
     hub: TunnelClientHub,
 }
@@ -774,7 +775,38 @@ impl Drop for SinkGuard {
         // currently subscribed, so a supervisor created later doesn't see a
         // stale sink from a dead connection.
         self.hub.inner.sink_tx.send_replace(None);
+        // FR-158 P1b (#4501): a quic-v1 session ends with the control socket it
+        // runs on. Its demux entry goes, so its Source ends and its carrier
+        // reads dead; the flow's next cycle waits for the new socket and opens
+        // its session there. A session kept would send its requests for new
+        // connections to no one. A session on another transport is outside
+        // FR-158 (its §8) and is left as it was.
+        let ended = end_quic_v1_sessions(&self.hub);
+        if ended > 0 {
+            info!(
+                ended,
+                "control socket dropped: its quic-v1 tunnel sessions ended; their flows open new ones on the next socket"
+            );
+        }
     }
+}
+
+/// FR-158 P1b: remove the demux entry of the quic-v1 session each flow runs,
+/// and say how many went ([`SinkGuard`]).
+fn end_quic_v1_sessions(hub: &TunnelClientHub) -> usize {
+    let sids: Vec<ObjectId> = hub
+        .inner
+        .flows
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|f| f.live.transport.lock().unwrap().as_deref() == Some(TRANSPORT_QUIC_V1))
+        .filter_map(|f| *f.live.session_id.lock().unwrap())
+        .collect();
+    let mut sessions = hub.inner.client_sessions.lock().unwrap();
+    sids.iter()
+        .filter(|sid| sessions.remove(sid).is_some())
+        .count()
 }
 
 /// The signaling-loop hook (mirrors `overlay::intercept`): consume a
@@ -826,7 +858,8 @@ impl TunnelSignalingSink for DaemonSink {
 /// The daemon's [`TunnelSignalingSource`]: a per-session mpsc fed by the hub's
 /// demux. Sniffs the pass-through `TunnelOpened` to record the negotiated
 /// transport + session id into the flow's live cells, then yields it to the
-/// driver. `None` = the session's demux entry was removed (WS drop / kill).
+/// driver. `None` = the session's demux entry was removed: the session or its
+/// flow ended, or it ran on quic-v1 over a control socket that dropped (P1b).
 ///
 /// It does NOT mark the flow `Up` (#1685). `rc:tunnel.opened` is the server
 /// accepting the open; the QUIC / DC-pool setup comes after it and can still
@@ -2639,6 +2672,80 @@ mod tests {
             sink_rx.borrow_and_update().is_none(),
             "the guard clears the sink on drop"
         );
+    }
+
+    /// A flow `fl-<n>` whose live session is `oid(n)` on `transport`, with its
+    /// demux entry, as `rc:tunnel.opened` leaves them. Returns its Source.
+    fn a_flow_running(hub: &TunnelClientHub, n: u8, transport: &str) -> ChannelSource {
+        let live = Arc::new(FlowLive::default());
+        *live.session_id.lock().unwrap() = Some(oid(n));
+        *live.transport.lock().unwrap() = Some(transport.to_string());
+        hub.inner.flows.lock().unwrap().insert(
+            format!("fl-{n}"),
+            FlowHandle {
+                abort: tokio::spawn(async {}).abort_handle(),
+                kind: FlowKind::Socks5,
+                local: 1080,
+                target: None,
+                node: "0123456789abcdef01234567".into(),
+                requested: "auto".into(),
+                route: None,
+                live: live.clone(),
+            },
+        );
+        let (tx, rx) = mpsc::channel::<ServerMsg>(4);
+        hub.inner.client_sessions.lock().unwrap().insert(oid(n), tx);
+        ChannelSource { rx, live }
+    }
+
+    /// FR-158 P1b (#4501): a quic-v1 session ends when the control socket it
+    /// runs on drops. Its demux entry goes, so its Source ends and its flow
+    /// opens the next session on the new socket, instead of keeping one whose
+    /// requests reach no one.
+    #[tokio::test]
+    async fn a_quic_session_ends_when_its_control_socket_drops() {
+        let hub = TunnelClientHub::new("t".into());
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(1);
+        let socket = hub.publish_sink(tx);
+        let mut source = a_flow_running(&hub, 1, TRANSPORT_QUIC_V1);
+        drop(socket);
+        let ended = tokio::time::timeout(Duration::from_secs(1), source.recv()).await;
+        assert!(
+            matches!(ended, Ok(None)),
+            "a quic-v1 session's source ends with its control socket"
+        );
+        assert!(
+            !hub.inner
+                .client_sessions
+                .lock()
+                .unwrap()
+                .contains_key(&oid(1))
+        );
+    }
+
+    /// FR-158 P1b: a session on a transport outside FR-158 (its §8) is left as
+    /// it was when the control socket drops.
+    #[tokio::test]
+    async fn a_session_outside_fr_158_is_left_as_it_was_when_its_control_socket_drops() {
+        let hub = TunnelClientHub::new("t".into());
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(1);
+        let socket = hub.publish_sink(tx);
+        let mut sources = [
+            (2u8, a_flow_running(&hub, 2, TRANSPORT_WEBRTC_DC_V1)),
+            (3u8, a_flow_running(&hub, 3, TRANSPORT_QUIC_DERP_V1)),
+        ];
+        drop(socket);
+        for (n, source) in &mut sources {
+            assert!(
+                hub.inner
+                    .client_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&oid(*n))
+            );
+            let open = tokio::time::timeout(Duration::from_millis(100), source.recv()).await;
+            assert!(open.is_err(), "session {n}: its source stays open");
+        }
     }
 
     /// Field 2026-08-22: a flow that opened and died at once reset the
