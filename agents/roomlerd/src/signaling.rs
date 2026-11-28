@@ -10755,6 +10755,75 @@ mod tests {
         assert_eq!(logs.lines_with(TUNNELS_TORN_DOWN).len(), 1);
     }
 
+    /// FR-22 P5-0 — before a sleep the closes take turns, as they did before
+    /// P5-0, and the loop does not wait for them. A close the suspend lands in
+    /// is cut at its ceiling when the computer wakes, where the monotonic
+    /// clock counts the sleep, and what it had not reached stays alive: in
+    /// turn keeps that to one peer.
+    ///
+    /// Red on P5-0's first cut: all three closes were under way at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_sleep_closes_its_tunnel_peers_in_turn_and_does_not_wait() {
+        let logs = Logged::start();
+        let took = Duration::from_secs(1);
+        let (mut peers, closes) = slow_tunnel_peers(3, took);
+        let before = tokio::time::Instant::now();
+
+        close_all_tunnel_peers(&mut peers, ConnExit::Sleep).await;
+
+        assert_eq!(
+            before.elapsed(),
+            Duration::ZERO,
+            "the caller waited for a close"
+        );
+        assert!(peers.is_empty(), "the map still holds a peer");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            (closes.started(), closes.ended()),
+            (1, 0),
+            "one close at a time"
+        );
+        tokio::time::sleep(took).await;
+        assert_eq!(
+            (closes.started(), closes.ended()),
+            (2, 1),
+            "the next starts when one ends"
+        );
+        tokio::time::sleep(took * 2).await;
+        assert_eq!((closes.started(), closes.ended()), (3, 3));
+        let torn_down = logs.lines_with(TUNNELS_TORN_DOWN);
+        assert_eq!(torn_down.len(), 1, "{torn_down:?}");
+        assert!(
+            torn_down[0].contains("count=3") && torn_down[0].contains(r#"exit="sleep""#),
+            "{torn_down:?}"
+        );
+    }
+
+    /// FR-22 P5-0 — the closes' tasks carry their loop's span. On a daemon
+    /// with several orgs an overrun and the count name their org, as they did
+    /// when the loop wrote them itself.
+    ///
+    /// Red on P5-0's first cut: a spawned task starts with no span.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_closes_lines_name_their_loops_org() {
+        let logs = Logged::start();
+        let (mut peers, _closes) = slow_tunnel_peers(1, PEER_CLOSE_BUDGET * 4);
+        let org = tracing::info_span!("org", label = %"second");
+
+        tracing::Instrument::instrument(
+            close_all_tunnel_peers(&mut peers, ConnExit::ReadError),
+            org,
+        )
+        .await;
+
+        tokio::time::sleep(PEER_CLOSE_BUDGET + Duration::from_millis(1)).await;
+        for line in [CLOSE_OVERRAN, TUNNELS_TORN_DOWN] {
+            let found = logs.lines_with(line);
+            assert_eq!(found.len(), 1, "{line}: {found:?}");
+            assert!(found[0].contains("org{label=second}"), "{line}: {found:?}");
+        }
+    }
+
     /// FR-22 P5-0 — a shutdown and a goodbye wait, because the process may end
     /// next, and they wait for all the closes together: one close's time, and
     /// one budget at most where every close overruns.
