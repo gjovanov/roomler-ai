@@ -382,6 +382,7 @@ one since P4. The channel owns the lifetime:
 | the client disconnects, or the carrier dies | the handler drops; `Drop` cancels every exec it still tracks |
 | the grant's `session_secs` deadline | `arm_session_deadline` disconnects → the same `Drop` |
 | the session itself vanishes under the pump | `handle.data` fails → the pump cancels the abort |
+| any of the above after the command has exited, while something it started holds its output | the same abort, heard in the run's final wait (`session_job::finish`, every OS): the session's job on Windows, its process group on Linux and macOS; the run then stops waiting within 0.5 s, whoever holds the pipes (#3361) |
 | the daemon leaves, by any route | on Windows the kernel ends the session's job as the process goes (§ [What outlives a session](#what-outlives-a-session-3303)) |
 | a key-list (break-glass) session | unbounded, as its pty is; the 600 s inactivity timeout still reaps a dead carrier |
 
@@ -418,7 +419,9 @@ the 4 KiB pipe fills, the child blocks on `WriteFile`.
 path exactly: `run_fed` with the 1 MiB ceiling and the 300 s wall clock, the
 output after the run, and a stderr notice when the ceiling cut it. **Fleet
 RPC is unaffected either way**: `rc:rpc.exec` never calls the streaming
-variant.
+variant. ⚠️ With `ssh_exec_streaming = false`, a client that leaves is heard
+by neither the run nor its final wait, on every OS: `buffer_to_channel` takes
+no abort, and the 300 s wall clock bounds only the run (#3361).
 
 **Exit status**: a real `0..=255` code is the SSH status; a signal-encoded or
 absent one (killed, cancelled, refused) is **1**. It is sent only after the
@@ -467,7 +470,7 @@ Mechanics worth knowing:
   `crates/tunnel-core/src/child.rs:465`; registered at
   `agents/roomlerd/src/pty/unix.rs:276`). It marks and never closes, so it
   cannot undo the drop. A one-shot command and a Fleet RPC command
-  (`agents/roomlerd/src/exec.rs:2442`) and `sftp-server`
+  (`agents/roomlerd/src/exec.rs:2445`) and `sftp-server`
   (`agents/roomlerd/src/ssh.rs:1313`) sweep the same way. The overlay's TUN
   device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
@@ -678,18 +681,52 @@ can prove a supervisor (`docs/remote-config.md`).
 so a command with `-t` or `-tt` runs in the exec engine like any one-shot.
 `start_pty_session` runs only for a shell.
 
-**Linux and macOS: unread in the field, this is the code's account** (#3361).
-There is no job, and a process group is reached only by someone who signals it.
-Under systemd no unit sets `KillMode=`, so the default `control-group` ends
-everything in the unit's cgroup on a stop and on a crash. launchd and an unmanaged
-daemon reach no group, so a one-shot, which leads its own
-([`exec.rs`](../agents/roomlerd/src/exec.rs)), outlives them: a stop ends its direct
-child at most, through `kill_on_drop`, and a crash ends nothing. An interactive
-shell is hung up as the pty's master closes, with or without code running, and
-`PtyProcess`'s `Drop` signals its group. The pump's abort is shared code, so a
-client that goes ends a quiet shell here too, which
-`a_client_vanishing_ends_a_quiet_interactive_shell` locks on Linux. No lane runs it
-on macOS.
+**Linux and macOS** (#3361). There is no job: a one-shot's container is the
+process group its command leads (`process_group(0)`), and the step that settles a
+finished command is the same as on Windows (`session_job::finish`,
+[`exec.rs`](../agents/roomlerd/src/exec.rs)). A group is reached only by someone
+who signals it, so the daemon's leaving ends it only as far as the service manager
+does. Read by the Linux tests in `exec.rs` (`session_group_tests`), and **unread
+on a device**:
+
+| How the session ends | `ssh node 'cmd'` | `ssh node` |
+|---|---|---|
+| the command ends by itself, its output at EOF | what it left running **stays**: nothing signals its group after that (`what_a_command_left_running_when_it_ended_stays`) | the pty's master closes: hung up |
+| the client goes while the command runs | its process group ends | the pump's abort drops the pty (`a_client_vanishing_ends_a_quiet_interactive_shell`) |
+| the client goes after the command has exited, while something it started holds its output | its process group ends, and the run stops waiting within 1 s (`a_client_gone_after_the_command_exited_ends_its_group`). Until #3361 the run waited for as long as that process lived | not a case: the session is the shell |
+| the daemon stops, or crashes | unread. By the code: under systemd no unit sets `KillMode=`, so the default `control-group` ends everything in the unit's cgroup; launchd and an unmanaged daemon reach no group, so a stop ends the command's direct child at most (`kill_on_drop`) and a crash ends nothing | unread. By the code: the pty's master closes as the process goes and hangs the shell up, with or without code running |
+
+The shell is not collected while its group may still be signalled: an unreaped
+zombie keeps its pid, and with it the group's id, reserved, so the `killpg` cannot
+land on a group the kernel has handed to someone else since. `virtual_desktop.rs`'s
+teardown keeps the same rule.
+
+**What a group cannot promise.**
+- A process that left the session's group is out of its reach: `setsid`, a
+  `setpgid` into another group, a daemon's double fork. It does not hold the run
+  either: once the group is ended, the run waits at most 0.5 s more for its output
+  (`DRAIN_WITHIN`) and stops reading it
+  (`a_process_that_left_the_group_does_not_hold_the_run_past_its_client`). Nobody
+  reads that output after that, so the holder's next write to it fails (`SIGPIPE`),
+  as when an OpenSSH session's reader goes. What the buffered path had collected by
+  then is not sent.
+- A command found outside a group of its own runs without the guarantee, and the
+  daemon's log says `ssh: the session's command does not lead its own process group
+  — descendants may outlive it`.
+- Fleet RPC has no group, and its final wait is as it always was:
+  `a_fleet_rpc_commands_final_wait_is_as_it_was` locks it.
+- With `ssh_exec_streaming = false` a client that leaves is heard by neither the
+  run nor its final wait, on every OS (the kill switch in
+  § [One-shot commands stream](#one-shot-commands-stream-fr-89)).
+  The buffered path's final wait hears only the engine's own cancel.
+
+The rows a device must still give, as #3303 measured Windows: each session shape
+(a one-shot held by its command, a one-shot that returned and left a process,
+`ssh -tt node 'script'`, a busy shell, a shell at a prompt, sftp) against the daemon
+stopping, the daemon killed with `SIGKILL`, the client killed, and the command
+ending by itself, on Linux under the system unit, under the per-user unit and with
+nothing supervising it, and on macOS under launchd. No lane runs the interactive
+test on macOS.
 
 ### Which account a session runs as (P5a)
 
@@ -711,9 +748,9 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1865`](../agents/roomlerd/src/exec.rs#L1865)). Exec, the pty and `sftp`
+[`exec.rs:1868`](../agents/roomlerd/src/exec.rs#L1868)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:819`](../agents/roomlerd/src/exec.rs#L819)), so one rule covers all
+([`exec.rs:822`](../agents/roomlerd/src/exec.rs#L822)), so one rule covers all
 three.
 
 ```mermaid
@@ -773,13 +810,13 @@ the account, for as long as it took. It now asks through the one seat0 lookup in
 flight that a received file asks (`files::ask_seat0`, on a thread named
 `seat0-lookup`, [`files.rs:1061`](../agents/roomlerd/src/files.rs#L1061)), awaited
 from the session's own task, `SEAT_LOOKUP_WAIT` (1.5 s) at most
-(`exec::console_account`, [`exec.rs:919`](../agents/roomlerd/src/exec.rs#L919)). It
+(`exec::console_account`, [`exec.rs:922`](../agents/roomlerd/src/exec.rs#L922)). It
 asks at the same point as before: after every gate and the consent prompt, right
 before the drop. A hung logind holds one thread for files, exec and SSH together,
 and each later caller waits on that lookup within its own 1.5 s, starting none.
 
 Only a person's answer is an account (`exec::console_person`,
-[`exec.rs:972`](../agents/roomlerd/src/exec.rs#L972)):
+[`exec.rs:975`](../agents/roomlerd/src/exec.rs#L975)):
 
 | The lookup answers | The command or session |
 |---|---|
@@ -828,10 +865,10 @@ worker and every socket and timer on it: the shape #3830 measured for a hung log
 The lookup now runs on a thread of its own, named `account-lookup`, through one
 lookup in flight **per account name** (`one_in_flight::OneInFlightPerKey`,
 [`one_in_flight.rs:407`](../agents/roomlerd/src/one_in_flight.rs#L407); the
-daemon's `ACCOUNTS`, [`exec.rs:1550`](../agents/roomlerd/src/exec.rs#L1550)). The
+daemon's `ACCOUNTS`, [`exec.rs:1553`](../agents/roomlerd/src/exec.rs#L1553)). The
 session's own task awaits it `ACCOUNT_LOOKUP_WAIT` (1.5 s) at most
 (`unix_priv::session_account`,
-[`exec.rs:1572`](../agents/roomlerd/src/exec.rs#L1572)), at the same point as
+[`exec.rs:1575`](../agents/roomlerd/src/exec.rs#L1575)), at the same point as
 before: after every gate and the consent prompt, right before the drop.
 
 - **Keyed by the name.** `named:ana` and a `console_user` session whose person is
@@ -851,7 +888,7 @@ before: after every gate and the consent prompt, right before the drop.
   memory the drop already owns.
 
 What the lookup gives decides the session (`unix_priv::in_time`,
-[`exec.rs:1605`](../agents/roomlerd/src/exec.rs#L1605)):
+[`exec.rs:1608`](../agents/roomlerd/src/exec.rs#L1608)):
 
 | The lookup, within 1.5 s | The command or session |
 |---|---|
@@ -862,7 +899,7 @@ What the lookup gives decides the session (`unix_priv::in_time`,
 `console_user` asks who is at the screen first (#3822's 1.5 s on Linux; on a Mac
 the owner of `/dev/console`, a `stat` child, now asked through one lookup in flight
 on a thread named `console-owner`, `exec::ask_console_owner`,
-[`exec.rs:1015`](../agents/roomlerd/src/exec.rs#L1015), with #3822's
+[`exec.rs:1018`](../agents/roomlerd/src/exec.rs#L1018), with #3822's
 try-again words when it gives no answer), then looks the person's account up as
 above, so it waits 3 s at most. The refusal reaches the caller where every refusal
 does: the Fleet RPC result's `error` (and `exec_audit`), `roomler-ssh: …` on the SSH
@@ -889,11 +926,11 @@ session environment) and `account_ids` / `account_home` (the recorder's and rece
 files' identity). Each looked the account up inline, so while the account database
 hung, every ask held its blocking thread for as long as the hang lasted. They now ask
 the same lookup in flight (`unix_priv::account_blocking`,
-[`exec.rs:1311`](../agents/roomlerd/src/exec.rs#L1311), through
+[`exec.rs:1314`](../agents/roomlerd/src/exec.rs#L1314), through
 `OneInFlightPerKey::ask_blocking`,
 [`one_in_flight.rs:452`](../agents/roomlerd/src/one_in_flight.rs#L452)), 1.5 s at most
 from the caller's own thread. The recorder's uid is looked up through one lookup in
-flight per uid (`account_name`, [`exec.rs:1476`](../agents/roomlerd/src/exec.rs#L1476)).
+flight per uid (`account_name`, [`exec.rs:1479`](../agents/roomlerd/src/exec.rs#L1479)).
 An ask from the recorder's launch and an exec as the same account share one lookup.
 A refusal carries the try-again words above through each caller's own error:
 
@@ -1700,7 +1737,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:1184`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:1187`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command

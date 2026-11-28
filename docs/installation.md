@@ -3919,7 +3919,7 @@ flowchart TD
   daemon serves, or carries to the Windows service on port 2223 (FR-105,
   `agents/roomlerd/src/ssh_service.rs:914`). A Fleet RPC command for as long as
   it runs, 5 min at most, counted by the exec engine for each run
-  (`agents/roomlerd/src/exec.rs:2347`); a command an SSH session runs
+  (`agents/roomlerd/src/exec.rs:2350`); a command an SSH session runs
   belongs to that connection and is not counted twice. On a Windows device
   anchored for SYSTEM exec (FR-94), a command the `Roomler` service runs for
   the worker, from its claim until its result is posted, which the worker asks
@@ -4542,7 +4542,7 @@ What a console stream is, by the way a binary runs:
 | Windows: the per-user daemon | `NUL` ([above](#what-the-per-user-scheduled-task-runs-3292)) | not read |
 | Windows: the SystemContext worker | a console with no window | no console layer at all ([#3438](#what-the-system-workers-console-carries-3438)), unchanged |
 | Windows: the service host; the companion and the wizard started from Explorer or at sign-in | no console | nothing is written |
-| a command run by Fleet RPC (`roomler exec`) | a pipe (`agents/roomlerd/src/exec.rs:2394`) | plain |
+| a command run by Fleet RPC (`roomler exec`) | a pipe (`agents/roomlerd/src/exec.rs:2397`) | plain |
 | the DERP relay at a PoP (`docker compose`, no `tty:`) or in a pod | a pipe | plain |
 | any of these with `NO_COLOR` set to a value | | plain |
 
