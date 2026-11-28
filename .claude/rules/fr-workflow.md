@@ -61,12 +61,14 @@ write-up filed afterwards. Registry and full protocol: **`docs/fr/README.md`**.
    AC4, FR-77's P3). The live FR's open box carries what is owed, so a pin would
    count it twice. A pin is for a close that leaves its boxes unticked: not
    planned, superseded. `docs/fr/README.md` has both forms.
-   ⚠️ **The issue closes minutes BEFORE the PR that records its close merges.** The
-   check reads live issue state: a pin for an open issue is a fault on the PR, and
-   a closed issue with no pin on master is a fault on every `docs/fr` PR. Order:
-   the other lanes green, the issue's body and result comment, the close, the debt
-   lane re-run to green, the merge. A refused merge reopens the issue at once
-   (#3954, #4551).
+   ⚠️ **The pins decide which comes first, the close or the merge.** The check reads
+   live issue state. It faults a closed issue with an open box and no pin, and a
+   pin for an open issue. A PR with NO pin (ticked boxes, a moved criterion) merges
+   first, and the issue closes right after: nothing reads red. A PR WITH a pin
+   needs the issue closed minutes BEFORE it merges: the other lanes green, the
+   closing comment, the close, the debt lane re-run to green, the merge. A refused
+   merge reopens the issue at once (#3954, #4551). Never close first without a
+   pin: master then fails every `docs/fr` PR until the merge.
    ⚠️ **The commit that closes an FR pins its spec** (#4413): it adds the preamble
    pin `` **Anchors:** master `<sha>` (closed <date>) `` as its own paragraph under
    the CLOSED banner, naming the master commit the close reads. A closed spec is

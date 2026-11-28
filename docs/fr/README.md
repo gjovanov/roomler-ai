@@ -93,18 +93,27 @@ happened to the criterion:
 
 | What happened | In the closed spec and its issue | Where the debt is counted |
 |---|---|---|
-| It **moved** to a live FR, and the rest are met (FR-62's AC4, FR-77's P3) | the box becomes a plain bullet: "moved to FR-M (#n) ACk on <date>", with "not met" where it is not | once, as an open box on the live FR, which carries what is owed. No pin |
+| It **moved** to a live FR, and the rest are met (FR-62's AC4, FR-77's P3) | the box becomes a plain bullet: `moved to FR-M (#n) ACk on <date>`, with "not met" where it is not | once, as an open box on the live FR, which carries what is owed. No pin |
 | The FR closed **not planned**, superseded (the 2026-11-16 batch, FR-14) | the boxes stay as they were read, and the superseding spec maps each one | pinned in `scripts/fr-ac-debt-baseline.txt` as `FR-N=<count>  # reason`, with `nodocs FR-N  # reason` when the spec has no docs criterion |
 
-**The issue closes minutes before the PR that records its close merges.**
-`scripts/fr-verification-debt.sh` reads the issue's live state. A pin for an issue that is
-still open fails on the PR, and an issue closed with no pin on master fails on every
-`docs/fr` PR, so one of the two is red for a while, and it is the PR. The order: every other
-lane green; the issue's body and its result comment; the close; the debt lane re-run to
-green; the merge. A refused merge reopens the issue at once (#3954, #4551). Another `docs/fr`
-PR whose debt lane runs inside that window reads red, and it needs a new push after the
-merge: a re-run keeps its old merge ref. The check can be rehearsed first: run it with a
-stand-in `gh` on `PATH` that prints the issue list with the issue shown as closed.
+**The pins decide which comes first, the close or the merge.**
+`scripts/fr-verification-debt.sh` reads the issue's live state. It faults a closed issue whose
+spec has an open box and no pin, and it faults a pin for an issue that is still open.
+
+- **A PR with no pin merges first, and the issue closes right after.** That is a close on
+  ticked boxes, and a close with a moved criterion. Master's spec then has no open box, so
+  nothing reads red on either side.
+- **A PR with a pin needs the issue closed minutes before it merges.** The pin fails on the
+  PR while the issue is open. The closed issue fails on master, and so on every `docs/fr`
+  PR, until the pin lands. One of the two is red for a while, and it is the PR. The order:
+  every other lane green; the issue's closing comment; the close; the debt lane re-run to
+  green; the merge. A refused merge reopens the issue at once (#3954, #4551). Another
+  `docs/fr` PR whose debt lane runs inside that window reads red, and it needs a new push
+  after the merge: a re-run keeps its old merge ref.
+
+#4551 carried both forms and closed both issues first. Only FR-14's pins needed that, and
+FR-77's issue could have closed after the merge. The check can be rehearsed with a stand-in
+`gh` on `PATH` that prints the issue list with each issue in the state to try.
 
 A `file:N-M` range reads start ≤ end: CI's `scripts/anchor-range-audit.sh` fails on a new
 inverted one. The 31 already on master when it landed (2026-10-21, all half-shifted) are
