@@ -88,20 +88,20 @@ const EARLY_SPAN: Duration = Duration::from_millis(50);
 const TRIAL_STANDING: u32 = 2;
 const TRIAL_CLEAR: u32 = TRIAL_STANDING * ROUND_SAMPLES;
 
-/// FR-148 4a-3c — the queue a short path's claim may build on the link it
-/// claims ([`Claim::probe`]): three quarters of P-e's 50 ms, the margin
-/// [`pace_share`] keeps ([`PACE_MARGIN`]). On a link faster than the claim,
-/// a probe of k messages of one lead L each comes back in the least round
-/// trip R and the writer's reply to its SACKs, d, so it reads k·L/(R + d) of
-/// the claim. Filling R and this much more, k·L ≥ R + 37.5 ms − L, and that
-/// exceeds 1.25·(R + d), which refutes the claim, for every lead under
-/// 37.5 ms − R/4 − 1.25·d: about 13 ms at R = 50 ms in the model of the
-/// train, where d is about 9 ms. A probe of one message more than the claim's
-/// link serialises in 50 ms ignored R: at 8 Mbit/s and 50 ms a 20 ms stall in
-/// the first round read as a claim the probe could not refute, and the train
-/// stopped on a plateau at 0.05 of the link, where sized by the least it read
-/// 1.03 (the model). A longer lead on a faster link is still not refuted.
-const CLAIM_QUEUE: Duration = Duration::from_micros(37_500);
+/// FR-148 4a-3d — the packets a receiver acknowledges in one SACK while none
+/// arrives out of order: every second one at once, and a lone one only when
+/// its delayed acknowledgement fires (RFC 4960 §6.2, and the vendored
+/// crate's). A claim's probe is a whole number of them ([`Train::probe`]):
+/// with an odd number in flight the last packet waits a round for its
+/// partner, so a delivery the cap holds reads one message a round short, as
+/// SCTP's pace and not the link's. At 8/20/C a first-round stall's lead of
+/// 17.7 ms claimed 68 kB/s on a 1 MB/s link, and a probe of three came back
+/// as one SACK of two, 2,400 bytes over 29.7 ms: 81 kB/s, within a quarter of
+/// the claim, which stood, and the train stopped on a plateau at 0.09
+/// (4a-3c's settling run, seed 4). With an odd probe allowed, the model of
+/// the train breaks 794 runs that 4a-3c's rule holds, against 12 with an
+/// even one.
+const SACK_PACKETS: u64 = 2;
 
 /// Once the bottleneck first queued, the train writes no more than what had
 /// been acknowledged then and what its estimate of the rate carries in this
@@ -419,11 +419,12 @@ struct Run {
 /// the same bound, the whole window and the write budget, and only samples of
 /// packets sent after it engaged judge it: [`TRIAL_STANDING`] that stand
 /// confirm it, and [`TRIAL_CLEAR`] that do not lift it. A stall cannot
-/// confirm the trial it engaged, and a second one cannot alone. Where no
-/// sample can stand, on a short path to a slow link, the delivery judges the
-/// trial instead ([`Claim`]). Until it is confirmed, no round counts as held
-/// at it, so a plateau never stops a train on a cap a stall set, and the most
-/// one step acknowledged keeps its value: a stall's held SACKs come at once.
+/// confirm the trial it engaged, and a second one cannot alone. A trial that
+/// began on a lead read as the link puts that lead to the test ([`Claim`]),
+/// and a delivery that refutes it lifts the trial at once. Until it is
+/// confirmed, no round counts as held at it, so a plateau never stops a
+/// train on a cap a stall set, and the most one step acknowledged keeps its
+/// value: a stall's held SACKs come at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Hold {
     /// The step it engaged at: a sample of a packet sent before this does
@@ -434,44 +435,41 @@ struct Hold {
     /// Samples of packets sent since that stood, and that did not.
     stood: u32,
     clear: u32,
-    /// The short path's claim, if the trial began on one.
+    /// The lead the trial read as the link, if it began on one.
     claim: Option<Claim>,
 }
 
-/// FR-148 4a-3c — a short path's claim, put to the test. On a path under
-/// [`QUEUE_FLOOR`] and [`QUEUED`] to a slow link, the receiver acknowledges
-/// every second packet, so each sampled packet left first of its pair and met
-/// no queue: three messages fill 0.4/20 with no sample standing, and a climb
-/// that waited for one queued 140 ms against P-e's 50. A trial's lead under
-/// the least round trip there claims a link that serialises one message in
-/// that lead. The cap lets out [`Claim::probe`] messages, which such a link
-/// queues for [`CLAIM_QUEUE`] at most, and the delivery over a least round trip
-/// with that much out answers: more than a quarter above the claim refutes it
-/// (a stall's lead, on a faster link), within it confirms the trial.
+/// FR-148 4a-3d — a lead read as the link, put to the test by delivery. A
+/// trial reads its engagement as a link that serialises one message in a
+/// lead: the pair's, on any path where the first sample was a pair
+/// ([`Train::pair`]), or under [`QUEUE_FLOOR`] and [`QUEUED`] its own lead
+/// where that is shorter than the least round trip. A stall's lead reads the
+/// same, so the lead is only a claim. While it is open the cap is its
+/// probe ([`Train::probe`]), a whole number of [`SACK_PACKETS`] that SCTP
+/// lets out and the receiver acknowledges, and a window opens at the first
+/// judging sample once SCTP has the probe in flight. Over a least round trip
+/// or more, a delivery more than a quarter above the claim refutes it. Until
+/// then, while the probe's messages at the claimed rate take more than a
+/// quarter longer than the window, a faster link had them to deliver within
+/// it, and the window goes on; once they take less, the probe was too small
+/// to refute over that window, and it grows by [`SACK_PACKETS`]. A delivery
+/// never confirms a claim: on the claimed link the probe builds the link's
+/// own queue, whose samples stand and confirm the trial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Claim {
-    /// The trial's lead: one message's serialisation at the claimed rate.
+    /// One message's serialisation at the claimed rate.
     lead: Duration,
-    /// The least round trip when the trial engaged.
-    least: Duration,
-    /// The first judging sample's `(at, acked)`, which the delivery counts
-    /// from, and the most out since.
+    /// The probe's messages as the step began, and whether SCTP had them all
+    /// in flight at a step since the probe last grew.
+    probe: u64,
+    out: bool,
+    /// The first judging sample's `(at, acked)` once the probe was out: the
+    /// window the delivery counts from.
     from: Option<(Duration, u64)>,
-    out: u64,
-    /// `Some(true)` once the delivery confirmed it, `Some(false)` once it
-    /// refuted it.
-    verdict: Option<bool>,
-}
-
-impl Claim {
-    /// The messages the claim may keep out: as many as its link serialises
-    /// in the least round trip and [`CLAIM_QUEUE`], and
-    /// [`CAP_FLOOR_MESSAGES`] at least.
-    fn probe(&self) -> u64 {
-        let per = self.lead.as_micros().max(1);
-        let held = (self.least + CLAIM_QUEUE).as_micros() / per;
-        CAP_FLOOR_MESSAGES.max(u64::try_from(held).unwrap_or(0))
-    }
+    /// Windows too short for the probe to refute the claim over.
+    grown: u64,
+    /// A delivery refuted it.
+    refuted: bool,
 }
 
 /// FR-148 4a-3c — what the cap's trials came to, for the daemon's INFO line
@@ -482,9 +480,15 @@ pub struct Trials {
     pub engaged: u32,
     pub confirmed: u32,
     pub lifted: u32,
-    /// Short paths' claims put to the test, and those the delivery refuted.
+    /// Leads read as the link and put to the test, and those the delivery
+    /// refuted.
     pub claimed: u32,
     pub refuted: u32,
+    /// FR-148 4a-3d — the claims made on a path whose least round trip is
+    /// [`QUEUE_FLOOR`] and [`QUEUED`] or more, where 4a-3c read the pair as
+    /// the link untested, and the times a probe grew.
+    pub long: u32,
+    pub grown: u32,
 }
 
 /// The open-time train's state.
@@ -678,6 +682,14 @@ impl Train {
         if self.sends.last().is_none_or(|&(_, s)| sent > s) {
             self.sends.push((at, sent));
         }
+        if let Some(c) = self.open_claim() {
+            // What SCTP let out of the probe the cap kept since the last step.
+            let probe = self.probe(&c);
+            if let Some(c) = self.hold.as_mut().and_then(|h| h.claim.as_mut()) {
+                c.probe = probe;
+                c.out |= gauges.inflight_bytes >= probe * msg;
+            }
+        }
         let step_acked = acked.saturating_sub(self.last_acked);
         // A SACK of one message is a lone packet's, and may have waited for
         // the receiver's delayed acknowledgement: it is not a sample.
@@ -782,11 +794,6 @@ impl Train {
             room = room.min(left);
         }
         let n = want.min(room).min(BUDGET - self.written) / msg * msg;
-        if let Some(c) = self.hold.as_mut().and_then(|h| h.claim.as_mut())
-            && c.from.is_some()
-        {
-            c.out = c.out.max(out + n);
-        }
         self.written += n;
         self.last_at = at;
         Step::Write(n)
@@ -809,12 +816,14 @@ impl Train {
     /// FR-148 4a-3c — whether the bottleneck queued, from the sample `s` of
     /// the bytes up to `acked` that the step at `at` took. The greatest sample
     /// [`QUEUED`] above the least engages the cap on trial ([`Hold`]), with a
-    /// claim on a short path ([`Claim`]). On trial, only a sample whose packet
-    /// left at or after the cap engaged judges it: [`TRIAL_STANDING`] that
-    /// stand confirm it, as a claim the delivery confirmed does, and
-    /// [`TRIAL_CLEAR`] that do not stand lift it, after which the greatest
-    /// sample is the least again, and a sample [`QUEUED`] above it engages the
-    /// cap anew.
+    /// claim where it began on a lead read as the link ([`Claim`]). On trial,
+    /// only a sample whose packet left at or after the cap engaged judges it:
+    /// [`TRIAL_STANDING`] that stand confirm it, and [`TRIAL_CLEAR`] that do
+    /// not stand lift it, after which the greatest sample is the least again,
+    /// and a sample [`QUEUED`] above it engages the cap anew. A delivery that
+    /// refutes the claim lifts it at once, unless one of its samples stood
+    /// (4a-3d): the trial has then met a queue of its own, which its samples
+    /// judge.
     fn judge(&mut self, s: Duration, at: Duration, acked: u64) {
         let (Some(least), Some(max)) = (self.min, self.max_sample) else {
             return;
@@ -825,15 +834,10 @@ impl Train {
         let Some(mut hold) = self.hold else {
             let lead = max.saturating_sub(least);
             if lead >= QUEUED {
-                let claim = (least < QUEUE_FLOOR + QUEUED && lead < least).then_some(Claim {
-                    lead,
-                    least,
-                    from: None,
-                    out: 0,
-                    verdict: None,
-                });
+                let claim = self.claim(lead, least);
                 self.trials.engaged += 1;
                 self.trials.claimed += u32::from(claim.is_some());
+                self.trials.long += u32::from(claim.is_some() && least >= QUEUE_FLOOR + QUEUED);
                 self.hold = Some(Hold {
                     at,
                     lead,
@@ -848,14 +852,19 @@ impl Train {
             return;
         }
         if let Some(c) = hold.claim.as_mut()
-            && c.verdict.is_none()
+            && !c.refuted
         {
             self.test_claim(c, least, at, acked);
+            if c.refuted && hold.stood == 0 {
+                self.hold = None;
+                self.max_sample = Some(least);
+                self.trials.lifted += 1;
+                return;
+            }
         }
         let stands = s.saturating_sub(least) >= QUEUED;
         hold.stood += u32::from(stands);
-        let claimed = hold.claim.is_some_and(|c| c.verdict == Some(true));
-        if hold.stood >= TRIAL_STANDING || (!stands && claimed) {
+        if hold.stood >= TRIAL_STANDING {
             self.hold = None;
             self.capped = true;
             self.trials.confirmed += 1;
@@ -871,26 +880,69 @@ impl Train {
         }
     }
 
-    /// FR-148 4a-3c — the claim `c` put to the test by the sample at `at` of
-    /// the bytes up to `acked`. The first sample that judges the trial starts
-    /// the count; from a least round trip `least` on, a delivery more than a
-    /// quarter above the claimed rate refutes the claim, and one within it,
-    /// with the probe's messages out since the count began, confirms it.
-    fn test_claim(&mut self, c: &mut Claim, least: Duration, at: Duration, acked: u64) {
-        let Some((t, a)) = c.from else {
-            c.from = Some((at, acked));
-            c.out = 0;
-            return;
+    /// FR-148 4a-3d — the claim a trial that engaged on `lead` over the
+    /// least round trip `least` makes, if any: the pair's lead where the
+    /// first sample was a pair, on any path; else, on a path under
+    /// [`QUEUE_FLOOR`] and [`QUEUED`], the trial's own lead where it is
+    /// shorter than the least round trip. On a long path 4a-3c read the pair
+    /// as the link untested, and a first-round stall's pair, one message in
+    /// 40.6 ms at 50 Mbit/s and 80 ms, held a cap of three messages for some
+    /// 900 ms and spent the write budget it sized: floors at 0.00 and 0.03.
+    fn claim(&self, lead: Duration, least: Duration) -> Option<Claim> {
+        let lead = if self.pair() > 0 {
+            self.first_sample?.saturating_sub(least)
+        } else if least < QUEUE_FLOOR + QUEUED && lead < least {
+            lead
+        } else {
+            return None;
         };
-        if at.saturating_sub(t) < least {
+        Some(Claim {
+            lead,
+            probe: 0,
+            out: false,
+            from: None,
+            grown: 0,
+            refuted: false,
+        })
+    }
+
+    /// The trial's claim while no delivery has refuted it.
+    fn open_claim(&self) -> Option<Claim> {
+        self.hold.and_then(|h| h.claim).filter(|c| !c.refuted)
+    }
+
+    /// FR-148 4a-3d — the claim `c` put to the test by the sample at `at` of
+    /// the bytes up to `acked`. Once SCTP had the probe in flight, the first
+    /// sample that judges the trial opens the window. From a least round trip
+    /// `least` on, a delivery more than a quarter above the claimed rate
+    /// refutes the claim. One within it says only that the link carried what
+    /// it was given: while the probe's messages, at the claimed rate, take
+    /// more than a quarter longer than the window, a faster link could have
+    /// shown itself in it, and the window goes on; once they take less, the
+    /// probe grows by [`SACK_PACKETS`], and the next window opens once SCTP
+    /// has the larger probe out. Where every window that did not refute
+    /// grew the probe at once, the model broke 134 runs that 4a-3c's rule
+    /// holds, against 12: on the claimed link each growth is queue.
+    fn test_claim(&mut self, c: &mut Claim, least: Duration, at: Duration, acked: u64) {
+        if !c.out {
             return;
         }
-        let delivered = rate(acked.saturating_sub(a), self.span(t, a, at, acked));
-        if delivered * 4 > rate(self.msg, c.lead) * 5 {
-            c.verdict = Some(false);
+        let Some((t, a)) = c.from else {
+            c.from = Some((at, acked));
+            return;
+        };
+        let span = self.span(t, a, at, acked);
+        if span < least {
+            return;
+        }
+        if rate(acked.saturating_sub(a), span) * 4 > rate(self.msg, c.lead) * 5 {
+            c.refuted = true;
             self.trials.refuted += 1;
-        } else if c.out >= c.probe() * self.msg {
-            c.verdict = Some(true);
+        } else if u128::from(c.probe) * c.lead.as_micros() * 4 <= span.as_micros() * 5 {
+            c.grown += 1;
+            c.out = false;
+            c.from = None;
+            self.trials.grown += 1;
         }
     }
 
@@ -1104,24 +1156,44 @@ impl Train {
     /// number of messages to that: a slow link's pipe is a few messages,
     /// and a train that writes in pairs fills it only with about a message
     /// more, which a cap cut down to whole messages can take away. While a
-    /// short path's claim is on test, never less than its probe
-    /// ([`Claim::probe`]).
+    /// claim is open, it is the claim's probe ([`Train::probe`]).
     fn cap(&self) -> u64 {
-        let probe = self
-            .hold
-            .and_then(|h| h.claim)
-            .filter(|c| c.verdict != Some(false))
-            .map_or(0, |c| c.probe() * self.msg);
+        match self.open_claim() {
+            Some(c) => self.probe(&c) * self.msg,
+            None => self.estimated_cap(),
+        }
+    }
+
+    /// The cap the estimate sets, [`Train::cap`] without a claim's probe;
+    /// `u64::MAX` while nothing estimates the rate.
+    fn estimated_cap(&self) -> u64 {
         let (c, Some(min)) = (self.estimate(), self.min) else {
             return u64::MAX;
         };
         if c == 0 {
-            return if probe > 0 { probe } else { u64::MAX };
+            return u64::MAX;
         }
         let cap = bytes_in(c, min + min.max(QUEUE_FLOOR) / 3)
             .max(bytes_in(self.best, min) + self.msg)
             .max(CAP_FLOOR_MESSAGES * self.msg);
-        ((cap + self.msg / 2) / self.msg * self.msg).max(probe)
+        (cap + self.msg / 2) / self.msg * self.msg
+    }
+
+    /// FR-148 4a-3d — the messages an open claim `c` keeps out: the trial's
+    /// own cap, as the estimate moves ([`CAP_FLOOR_MESSAGES`] while nothing
+    /// estimates the rate), rounded up to a whole number of
+    /// [`SACK_PACKETS`], and that many more for every window too short to
+    /// refute the claim over. On the claimed link the rounding queues one
+    /// message more than the cap at most, and each growth two. A probe fixed
+    /// at the trial's engagement broke 16 runs in the model, against 12. Its
+    /// writes are the train's, so the write budget bounds them, whatever the
+    /// probe asks.
+    fn probe(&self, c: &Claim) -> u64 {
+        let own = match self.estimated_cap() {
+            u64::MAX => CAP_FLOOR_MESSAGES,
+            cap => cap / self.msg,
+        };
+        own.next_multiple_of(SACK_PACKETS) + SACK_PACKETS * c.grown
     }
 
     /// The round ends: its delivery, and whether it pushed back.
@@ -1659,7 +1731,7 @@ mod cells {
             "train cell {} window {}: {} low {:.3} ({:.2}) high {} floor_only {} rounds {} \
              written {} wire {} min_rtt {:?} ss0 {} fr {} t3 {} t {} ms; \
              peak queue {:.1} ms, tail drops {}, drained {}, taken {}, limited by window {} cwnd {}; \
-             capped {cap}; trials {} lifted {} confirmed {} claims {} refuted {}; share {} then {}{}",
+             capped {cap}; trials {} lifted {} confirmed {} claims {} refuted {}; share {} then {}{}; {:?}",
             cell.name(),
             if cell.window == 0 {
                 1 << 20
@@ -1697,6 +1769,7 @@ mod cells {
                 "; stall began {} ms",
                 b.as_millis()
             )),
+            o.trials,
         )
     }
 
@@ -2631,11 +2704,15 @@ mod machine {
             }
         };
         assert_eq!(r.stop, Stop::Budget);
+        // Each trial claims the pair's lead on this long path (4a-3d), and
+        // its probe is the cap's four messages: the bound is the same.
         assert_eq!(
             t.trials(),
             Trials {
                 engaged: 2,
                 lifted: 1,
+                claimed: 2,
+                long: 2,
                 ..Trials::default()
             }
         );
@@ -2956,7 +3033,9 @@ mod machine {
     /// at the step that took the least, in the train's first round, with
     /// the write budget counted from then, as before; the queue its own
     /// bound keeps confirms it. 0.4/80/I read 87.7 ms of queue against P-e's
-    /// 80 when nothing bound it before a later sample stood.
+    /// 80 when nothing bound it before a later sample stood. The pair's lead
+    /// is a claim on this long path too (4a-3d), and its probe the cap's six
+    /// messages: on the claimed link its queue stands.
     #[test]
     fn a_slow_links_pair_engages_the_cap_in_the_first_round() {
         let mut t = Train::new(1_200);
@@ -2964,7 +3043,12 @@ mod machine {
         sack(&mut t, 133, 2 * MSG, 132);
         assert!(t.hold.is_none() && !t.capped && t.first_paired);
         sack(&mut t, 241, 4 * MSG, 108);
-        assert!(!t.capped && t.hold.is_some_and(|h| h.at == ms(241) && h.claim.is_none()));
+        assert!(!t.capped && t.hold.is_some_and(|h| h.at == ms(241)));
+        assert!(
+            t.hold
+                .is_some_and(|h| h.claim.is_some_and(|c| c.lead == ms(24)))
+        );
+        assert_eq!(t.cap(), 6 * MSG);
         assert_eq!(t.pair(), rate(MSG, ms(24)));
         assert_eq!(
             t.write_budget(),
@@ -3014,79 +3098,127 @@ mod machine {
         t
     }
 
-    /// A slow link on a short path: the receiver acknowledges every second
-    /// packet, so each sampled packet left first of its pair and meets no
-    /// queue, and at 0.4/20/C samples of none lifted the trial, and the climb
-    /// that followed queued 140 ms against P-e's 50. The trial's lead claims
-    /// a link of a message per lead: at 0.4 Mbit/s, 24 ms. The cap lets out
-    /// the probe, three messages, which that link queues for 48 ms; a least
-    /// round trip later the delivery, 50 kB/s, agrees with the claim, and a
-    /// sample of no queue confirms the trial. The first sample that judges
-    /// it only starts the count.
+    /// FR-148 4a-3d: a delivery that agrees with a claim confirms nothing; the
+    /// claimed link's own queue does. A slow link on a short path: the
+    /// trial's lead of 24 ms claims 0.4 Mbit/s, and the cap is the probe, the
+    /// trial's own three messages rounded up to two SACKs' four. Once SCTP has
+    /// them out, a least round trip's delivery, 50 kB/s, agrees with the
+    /// claim, and 4a-3c confirmed the trial on that, at a sample of no queue.
+    /// A link a quarter faster would have shown in it as well, so the window
+    /// goes on; once it outlasts what the probe could refute over, the probe
+    /// grows by a pair, and the queue the six messages keep stands: two
+    /// samples of it confirm the trial.
     #[test]
-    fn a_short_paths_claim_confirms_the_trial_once_the_delivery_agrees() {
+    fn a_delivery_never_confirms_a_claim_the_links_own_queue_does() {
         let mut t = short_path(44, 50_000);
         sack_exact(&mut t, ms(140), 2 * MSG, ms(68), 3 * MSG);
-        let claim = t.hold.and_then(|h| h.claim);
-        assert!(claim.is_some_and(|c| c.lead == ms(24) && c.probe() == 3));
-        assert_eq!(t.cap(), 3 * MSG);
-        // Sent at 146: no queue, and the count begins.
-        sack_exact(&mut t, ms(190), 4 * MSG, ms(44), 3 * MSG);
-        assert!(!t.capped, "a short path's lead confirmed the cap untested");
-        let claim = t.hold.and_then(|h| h.claim);
-        assert!(claim.is_some_and(|c| c.from == Some((ms(190), 4 * MSG)) && c.out == 3 * MSG));
+        assert!(t.hold.is_some_and(|h| h.claim.is_some()));
+        assert_eq!(t.cap(), 4 * MSG);
+        // SCTP has the probe out; the first judging sample opens the window.
+        sack_exact(&mut t, ms(200), 4 * MSG, ms(50), 4 * MSG);
         // 48 ms on, two messages more: 50 kB/s, the claim's rate.
-        sack_exact(&mut t, ms(238), 6 * MSG, ms(44), 3 * MSG);
-        assert!(t.capped && t.hold.is_none());
+        sack_exact(&mut t, ms(248), 6 * MSG, ms(52), 4 * MSG);
+        assert!(
+            !t.capped,
+            "a delivery that agreed with the claim confirmed it"
+        );
+        assert!(t.hold.is_some() && t.trials().refuted == 0);
         assert_eq!(
-            t.trials(),
-            Trials {
-                engaged: 1,
-                confirmed: 1,
-                claimed: 1,
-                ..Trials::default()
-            }
+            t.cap(),
+            4 * MSG,
+            "the window went on with the probe as it was"
+        );
+        // 96 ms: four messages at 24 ms take 96 ms, under a quarter more.
+        sack_exact(&mut t, ms(296), 8 * MSG, ms(66), 4 * MSG);
+        assert!(!t.capped && t.hold.is_some());
+        assert_eq!(t.cap(), 6 * MSG);
+        sack_exact(&mut t, ms(300), 8 * MSG, ms(44), 6 * MSG);
+        sack_exact(&mut t, ms(344), 10 * MSG, ms(70), 6 * MSG);
+        assert!(t.capped && t.hold.is_none());
+        let n = t.trials();
+        assert_eq!(
+            (n.engaged, n.confirmed, n.lifted, n.claimed, n.refuted),
+            (1, 1, 0, 1, 0)
         );
     }
 
-    /// A stall on a short path to a fast link leads as a slow link's pair
-    /// does: at 8/20/I a SACK held 18 ms over a 23 ms least claims 67 kB/s,
-    /// and a rule that asked only whether the rate delivered so far, 60 kB/s
-    /// early in the climb, explains a lead that long confirmed it at once: a
-    /// cap of three messages, and a plateau at 0.10. The probe's three
-    /// messages come back faster than a quarter over the claim, which
-    /// refutes it; then samples of no queue lift the trial. A lead as long
-    /// as the least round trip, or a path of 60 ms, claims nothing.
+    /// FR-148 4a-3d: a long path's pair is a claim too. A stall held the
+    /// first SACK of a train 80 ms from its peer, so its pair reads one
+    /// message in 41 ms, 29 kB/s, on a link of several MB/s; 4a-3c read that
+    /// as the link, untested, and its cap of three messages held the climb
+    /// until eight clear samples lifted it, one a round trip, while the
+    /// write budget the pair sized was spent: at 50 Mbit/s behind the
+    /// viewer's window and at 8 Mbit/s behind the shallow buffer the train
+    /// stopped on floors at 0.00 and 0.03. The probe's four messages come
+    /// back within a round trip, twice the claim and more, which refutes it,
+    /// and the trial lifts at once, none of its samples having stood. Where
+    /// the write budget counts from does not move.
     #[test]
-    fn a_stalls_lead_on_a_short_path_is_refuted_by_the_delivery() {
+    fn a_first_round_stalls_pair_on_a_long_path_is_refuted_at_once() {
+        let mut t = climbing();
+        t.first_sample = Some(ms(121));
+        t.max_sample = Some(ms(121));
+        t.first_paired = true;
+        t.best = 0;
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(80), 2 * MSG);
+        assert!(t.hold.is_some_and(|h| h.claim.is_some()));
+        assert_eq!(t.pair(), rate(MSG, ms(41)));
+        assert_eq!(t.cap(), 4 * MSG);
+        sack_exact(&mut t, ms(141), 2 * MSG, ms(80), 4 * MSG);
+        // Sent from 141 on: four messages back within the round trip.
+        sack_exact(&mut t, ms(221), 4 * MSG, ms(80), 2 * MSG);
+        sack_exact(&mut t, ms(222), 6 * MSG, ms(80), 2 * MSG);
+        assert!(t.hold.is_some(), "refuted within a SACK's span");
+        sack_exact(&mut t, ms(302), 8 * MSG, ms(80), 2 * MSG);
+        assert!(
+            t.hold.is_none() && !t.capped,
+            "a stall's pair held the trial"
+        );
+        let n = t.trials();
+        assert_eq!(
+            (n.engaged, n.confirmed, n.lifted, n.claimed, n.refuted),
+            (1, 0, 1, 1, 1)
+        );
+        assert_eq!(t.capped_acked, Some(2 * MSG));
+        assert_eq!(
+            t.pace(),
+            Some(Pace {
+                share: pace_share(ms(80)),
+                cap: None
+            })
+        );
+    }
+
+    /// FR-148 4a-3d: a probe is a whole number of SACKs. A first-round stall
+    /// on a short path to a fast link: at 8/20/C a SACK held 17.7 ms over a
+    /// 23 ms least claimed 68 kB/s, and 4a-3c's probe of three came back as
+    /// one SACK of two, the third waiting for a partner, 2,400 bytes over
+    /// 29.7 ms: 81 kB/s, within a quarter of the claim, which stood, and the
+    /// train stopped on a plateau at 0.09. The probe here is four messages,
+    /// two SACKs, and they come back faster than a quarter over the claim,
+    /// which refutes it. A lead as long as the least round trip, or a path
+    /// of 60 ms with no pair, claims nothing.
+    #[test]
+    fn a_claims_probe_is_a_whole_number_of_sacks() {
         let mut t = short_path(23, 60_000);
         sack_exact(&mut t, ms(140), 2 * MSG, ms(41), 3 * MSG);
+        assert!(t.hold.is_some_and(|h| h.claim.is_some()));
+        assert_eq!(t.cap(), 4 * MSG, "an odd probe reads SCTP's pace");
+        sack_exact(&mut t, ms(141), 2 * MSG, ms(23), 4 * MSG);
+        // Sent from 141 on: two SACKs of two, and two more a round later.
+        for (at, bytes) in [(165, 4), (166, 6)] {
+            sack_exact(&mut t, ms(at), bytes * MSG, ms(24), 2 * MSG);
+            assert!(t.hold.is_some() && !t.capped);
+        }
+        sack_exact(&mut t, ms(190), 8 * MSG, ms(24), 2 * MSG);
         assert!(
-            t.hold
-                .is_some_and(|h| h.claim.is_some_and(|c| c.probe() == 3))
+            t.hold.is_none() && !t.capped,
+            "a stall's lead held the trial"
         );
-        // Sent from 147 on: four messages over 24 ms, 200 kB/s.
-        for (at, bytes) in [(170, 4), (182, 6), (194, 8)] {
-            sack_exact(&mut t, ms(at), bytes * MSG, ms(23), 3 * MSG);
-            assert!(!t.capped, "a stall's lead confirmed the cap");
-        }
-        let claim = t.hold.and_then(|h| h.claim);
-        assert!(claim.is_some_and(|c| c.verdict == Some(false)));
-        for i in 3..TRIAL_CLEAR {
-            let n = u64::from(i);
-            sack_exact(&mut t, ms(194 + 6 * n), (4 + 2 * n) * MSG, ms(23), 3 * MSG);
-            assert!(!t.capped);
-        }
-        assert!(t.hold.is_none());
+        let n = t.trials();
         assert_eq!(
-            t.trials(),
-            Trials {
-                engaged: 1,
-                lifted: 1,
-                claimed: 1,
-                refuted: 1,
-                ..Trials::default()
-            }
+            (n.engaged, n.confirmed, n.lifted, n.claimed, n.refuted),
+            (1, 0, 1, 1, 1)
         );
         for (least, delay) in [(40, 80), (60, 75)] {
             let mut t = short_path(least, 100_000);
@@ -3095,92 +3227,190 @@ mod machine {
         }
     }
 
-    /// The probe floors the cap while the claim is open: at a lead of 12 ms
-    /// and a least round trip of 30 ms, a link of one message per lead holds
-    /// the round trip and 37.5 ms of queue in five messages, and the cap lets
-    /// out five where the estimate gives three. A refuted claim's floor goes,
-    /// and the cap is the estimate's again.
+    /// FR-148 4a-3d: a probe too small to refute a claim over its window
+    /// grows until the delivery answers. A 25 ms stall on a 50 ms path to a
+    /// fast link claims 48 kB/s, and 4a-3c's probe, as many messages as the
+    /// claim serialises in the least round trip and 37.5 ms, was three: the
+    /// rule refuted a faster link only for leads under about 13 ms there,
+    /// and in the model 1,654 runs of stalls of 12 to 25 ms on 2 to 50 Mbit/s
+    /// broke a property. Four messages a round of 82 ms read 59 kB/s, within
+    /// a quarter of the claim, and 4a-3c confirmed the stall's trial on that.
+    /// The four take 100 ms at the claimed rate, less than a quarter over the
+    /// window, so they could not refute it there: the probe grows by a pair,
+    /// and six come back at 89 kB/s, which refutes the claim.
     #[test]
-    fn the_claims_probe_holds_the_cap_until_the_claim_is_refuted() {
-        let mut t = short_path(30, 20_000);
-        assert_eq!(t.cap(), 3 * MSG);
-        sack_exact(&mut t, ms(140), 2 * MSG, ms(42), 3 * MSG);
-        let claim = t.hold.and_then(|h| h.claim);
-        assert!(claim.is_some_and(|c| c.lead == ms(12) && c.probe() == 5));
-        assert_eq!(t.cap(), 5 * MSG);
-        if let Some(c) = t.hold.as_mut().and_then(|h| h.claim.as_mut()) {
-            c.verdict = Some(false);
-        }
-        assert_eq!(t.cap(), 3 * MSG);
-    }
-
-    /// The probe is sized by the least round trip, so a link faster than the
-    /// claim refutes it on every short path. A 12 ms stall on a fast link,
-    /// early in the climb, claims 100 kB/s, and the probe's messages come back
-    /// within a least round trip: at 30 ms five read 2.0 times the claim. At
-    /// 50 ms a probe of one message more than the claim serialises in 50 ms,
-    /// five, read 1.2 times it, under the quarter, and confirmed the stall's
-    /// trial at five messages; sized by the least, seven read 1.68 times it.
-    /// On the claimed link each probe queues [`CLAIM_QUEUE`] at most.
-    #[test]
-    fn a_faster_link_refutes_the_claim_on_every_short_path() {
-        for (least, probe) in [(30, 5), (40, 6), (48, 7), (50, 7), (55, 7), (59, 8)] {
-            let mut t = short_path(least, 20_000);
-            sack_exact(&mut t, ms(140), 2 * MSG, ms(least + 12), 3 * MSG);
-            let claim = t.hold.and_then(|h| h.claim);
-            assert!(
-                claim.is_some_and(|c| c.probe() == probe),
-                "{least}: {claim:?}"
-            );
-            assert!(ms(12) * u32::try_from(probe).unwrap() <= ms(least) + CLAIM_QUEUE);
-            assert_eq!(t.cap(), probe * MSG);
-            // A fast link: what is out comes back within the least round trip.
-            let mut acked = 2 * MSG;
-            for i in 1..=6 {
-                acked += probe * MSG / 2;
-                sack_exact(
-                    &mut t,
-                    ms(200 + i * least / 2),
-                    acked,
-                    ms(least),
-                    probe * MSG,
-                );
-                assert!(!t.capped, "{least}: a stall's claim confirmed the cap");
-            }
-            assert_eq!(t.trials().refuted, 1, "{least}");
-        }
-    }
-
-    /// A claim stands only once its probe was out: a delivery that agrees
-    /// with the claim while fewer messages were out says only that the link
-    /// carried what it was given. Here the write budget, 2,400 bytes and
-    /// 700 ms at 20 kB/s, is spent, so three of the five stay out and the
-    /// delivery, 60 kB/s against the claim's 100, leaves the trial on trial.
-    /// Once five were out the next sample confirms it.
-    #[test]
-    fn a_claim_stands_only_once_its_probe_was_out() {
-        let mut t = short_path(30, 20_000);
-        sack_exact(&mut t, ms(140), 2 * MSG, ms(42), 3 * MSG);
+    fn a_probe_too_small_to_refute_grows_until_the_delivery_answers() {
+        let mut t = short_path(50, 20_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(75), 3 * MSG);
         assert!(t.hold.is_some_and(|h| h.claim.is_some()));
-        sack_exact(&mut t, ms(190), 4 * MSG, ms(30), 3 * MSG);
-        sack_exact(&mut t, ms(230), 6 * MSG, ms(30), 5 * MSG);
+        assert_eq!(t.cap(), 4 * MSG);
+        sack_exact(&mut t, ms(141), 2 * MSG, ms(50), 4 * MSG);
+        sack_exact(&mut t, ms(200), 4 * MSG, ms(50), 4 * MSG);
+        sack_exact(&mut t, ms(241), 6 * MSG, ms(50), 4 * MSG);
+        sack_exact(&mut t, ms(282), 8 * MSG, ms(50), 4 * MSG);
         assert!(
             !t.capped,
-            "a claim stood with three of its five messages out"
+            "a stall's claim stood on a probe too small to refute it"
         );
+        assert!(t.hold.is_some() && t.trials().refuted == 0);
+        assert_eq!(t.cap(), 6 * MSG);
+        sack_exact(&mut t, ms(283), 8 * MSG, ms(50), 6 * MSG);
+        for (at, bytes) in [(340, 10), (367, 12), (394, 14)] {
+            sack_exact(&mut t, ms(at), bytes * MSG, ms(50), 6 * MSG);
+        }
+        assert!(t.hold.is_none() && !t.capped);
+        let n = t.trials();
+        assert_eq!(
+            (n.engaged, n.confirmed, n.lifted, n.claimed, n.refuted),
+            (1, 0, 1, 1, 1)
+        );
+    }
+
+    /// FR-148 4a-3d: the probe is the trial's own cap as the estimate moves,
+    /// rounded up to whole SACKs, and two messages more for each window it
+    /// grew by; a refuted claim's probe goes, and the cap is the estimate's
+    /// again. A claim of the pair on a long path: the estimate's cap of nine
+    /// messages is a probe of ten, and of twelve once it grew; as the
+    /// estimate nearly doubles, the cap's seventeen are a probe of twenty.
+    #[test]
+    fn the_probe_follows_the_trials_cap_in_whole_sacks() {
+        let mut t = climbing();
+        t.first_sample = Some(ms(104));
+        t.max_sample = Some(ms(104));
+        t.first_paired = true;
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(80), 8 * MSG);
         let claim = t.hold.and_then(|h| h.claim);
-        assert!(claim.is_some_and(|c| c.verdict.is_none() && c.out == 5 * MSG));
-        sack_exact(&mut t, ms(260), 8 * MSG, ms(30), 5 * MSG);
-        assert!(t.capped && t.hold.is_none());
+        assert!(claim.is_some_and(|c| c.lead == ms(24)), "{claim:?}");
+        assert_eq!(t.estimated_cap(), 9 * MSG);
+        assert_eq!(t.cap(), 10 * MSG);
+        let grow = |t: &mut Train| {
+            if let Some(c) = t.hold.as_mut().and_then(|h| h.claim.as_mut()) {
+                c.grown += 1;
+            }
+        };
+        grow(&mut t);
+        assert_eq!(t.cap(), 12 * MSG);
+        t.best = 190_000;
+        assert_eq!(t.estimated_cap(), 17 * MSG);
+        assert_eq!(t.cap(), 20 * MSG);
+        if let Some(c) = t.hold.as_mut().and_then(|h| h.claim.as_mut()) {
+            c.refuted = true;
+        }
+        assert_eq!(t.cap(), 17 * MSG);
         assert_eq!(
             t.trials(),
             Trials {
                 engaged: 1,
-                confirmed: 1,
                 claimed: 1,
+                long: 1,
                 ..Trials::default()
             }
         );
+    }
+
+    /// FR-148 4a-3d: a refutation lifts a trial at once only where none of
+    /// its samples stood; one that stood met a queue of its own, which the
+    /// trial's samples judge from then on, the cap the estimate's. Lifted on
+    /// any refutation, the model broke 18 runs that 4a-3c's rule holds,
+    /// against 12; never lifted by one, 13, with 8/80/I behind the shallow
+    /// buffer stalled in the first round on a floor at 0.05.
+    #[test]
+    fn a_refutation_after_a_sample_stood_leaves_the_trial_to_its_samples() {
+        let mut t = short_path(23, 60_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(41), 3 * MSG);
+        sack_exact(&mut t, ms(141), 2 * MSG, ms(23), 4 * MSG);
+        sack_exact(&mut t, ms(165), 4 * MSG, ms(24), 2 * MSG);
+        // Sent at 142, it met a queue: it stands.
+        sack_exact(&mut t, ms(176), 6 * MSG, ms(34), 2 * MSG);
+        assert!(t.hold.is_some_and(|h| h.stood == 1));
+        sack_exact(&mut t, ms(190), 8 * MSG, ms(24), 2 * MSG);
+        assert_eq!(t.trials().refuted, 1);
+        assert!(
+            t.hold.is_some() && !t.capped,
+            "a trial that met a queue lifted"
+        );
+        assert_eq!(t.cap(), t.estimated_cap());
+        sack_exact(&mut t, ms(200), 10 * MSG, ms(35), 2 * MSG);
+        assert!(t.capped && t.hold.is_none());
+    }
+
+    /// FR-148 4a-3d: a window opens only once SCTP has the probe in flight,
+    /// and spans a least round trip at least. While SCTP holds part of the
+    /// probe back, in its window, its pacer or the write budget, a delivery
+    /// says only that the link carried what it was given, and a probe grown
+    /// on it would be queue: here three of the four are out, and a delivery
+    /// of 60 kB/s over 40 ms against a claim of 100 grows nothing. SACKs a
+    /// host stall released together read nothing over their own span: two
+    /// messages a millisecond apart are 2.4 MB/s on the claimed link of
+    /// 50 kB/s.
+    #[test]
+    fn a_window_needs_the_probe_out_and_a_least_round_trip() {
+        let mut t = short_path(30, 20_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(42), 3 * MSG);
+        assert!(
+            t.hold
+                .is_some_and(|h| h.claim.is_some_and(|c| c.lead == ms(12)))
+        );
+        for (at, bytes) in [(190, 4), (230, 6), (270, 8)] {
+            sack_exact(&mut t, ms(at), bytes * MSG, ms(30), 3 * MSG);
+        }
+        assert!(
+            t.hold
+                .is_some_and(|h| h.claim.is_some_and(|c| !c.out && c.from.is_none()))
+        );
+        assert_eq!(t.cap(), 4 * MSG, "a window without the probe out grew it");
+        sack_exact(&mut t, ms(271), 8 * MSG, ms(30), 4 * MSG);
+        sack_exact(&mut t, ms(300), 10 * MSG, ms(30), 2 * MSG);
+        assert!(
+            t.hold
+                .is_some_and(|h| h.claim.is_some_and(|c| c.from == Some((ms(300), 10 * MSG))))
+        );
+
+        let mut t = short_path(44, 50_000);
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(68), 3 * MSG);
+        sack_exact(&mut t, ms(141), 2 * MSG, ms(44), 4 * MSG);
+        sack_exact(&mut t, ms(200), 4 * MSG, ms(50), 4 * MSG);
+        sack_exact(&mut t, ms(201), 6 * MSG, ms(50), 4 * MSG);
+        assert_eq!(t.trials().refuted, 0, "refuted over a millisecond");
+    }
+
+    /// FR-148 4a-3d: P-f holds whatever a probe asks. A probe is writes, and
+    /// every write the train makes keeps within the write budget, counted
+    /// once from what was acknowledged when the cap first applied: at 0.4
+    /// Mbit/s on a short path the claim's probe, grown here to 44 messages,
+    /// asks for 52,800 bytes in flight, more than the budget's 37,400 in all,
+    /// and the train writes 37,200, stops on the budget, and never passes it.
+    #[test]
+    fn every_probe_keeps_within_the_write_budget() {
+        let mut t = short_path(30, 50_000);
+        t.written = 4 * MSG;
+        sack_exact(&mut t, ms(140), 2 * MSG, ms(54), 2 * MSG);
+        assert!(
+            t.hold
+                .is_some_and(|h| h.claim.is_some_and(|c| c.lead == ms(24)))
+        );
+        let bound = 2 * MSG + bytes_in(50_000, WRITE_SPAN);
+        assert_eq!(t.write_budget(), Some(bound));
+        assert_eq!(bound, 37_400);
+        if let Some(c) = t.hold.as_mut().and_then(|h| h.claim.as_mut()) {
+            c.grown = 20;
+        }
+        assert_eq!(t.cap(), 44 * MSG);
+        let mut done = 2 * MSG;
+        let mut at = 140;
+        let r = loop {
+            at += 48;
+            done = (done + 2 * MSG).min(t.written);
+            let inflight = t.written - done;
+            let step = sack_exact(&mut t, ms(at), done, ms(30), inflight);
+            assert!(t.written <= bound, "{} bytes at {at} ms", t.written);
+            if let Step::Stopped(r) = step {
+                break r;
+            }
+        };
+        assert_eq!(r.stop, Stop::Budget);
+        assert_eq!(r.written_bytes, 31 * MSG);
+        assert!(r.written_bytes <= bound && bound < 64_000);
     }
 
     /// A round held at a cap on trial is not held at the cap: a stall whose
