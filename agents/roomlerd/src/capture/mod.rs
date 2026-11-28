@@ -923,15 +923,26 @@ pub(crate) const FILES_FOLLOW_THE_SCREEN: &str = files_follow_the_screen!();
 
 /// The `no_display` sentence on a Mac, which only its root daemon reaches: it
 /// runs in no login session. #4543 — `one_row`: this is a one-row Mac's root
-/// daemon (`consent_relay::one_row`).
+/// daemon (`consent_relay::one_row`), whose Mac has no other row to connect
+/// to. Off one row a two-row Mac's `-daemon` row sends the viewer to the
+/// person's own row, as it always did.
 ///
 /// ⚠️ On the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
 fn mac_no_display_hint(one_row: bool) -> &'static str {
-    let _ = one_row;
-    "This roomlerd runs as a system daemon, which has no desktop session and therefore no \
-     screen to capture. Connect to this machine's user-session roomlerd instead. Remote shell \
-     works here."
+    if one_row {
+        // No user-session roomlerd to send the viewer to: the screen is the
+        // person's screen worker's, and a session asked before it attached
+        // crosses to it at its offer (#4543), so this one found none.
+        "This roomlerd runs as a system daemon, which has no desktop session and therefore no \
+         screen to capture. On this Mac the screen is captured by the screen worker of the \
+         person signed in at it, and none served this session. Reconnect once someone is \
+         signed in at the Mac. Remote shell works here."
+    } else {
+        "This roomlerd runs as a system daemon, which has no desktop session and therefore no \
+         screen to capture. Connect to this machine's user-session roomlerd instead. Remote \
+         shell works here."
+    }
 }
 
 /// The `no_display` sentence off macOS, which only Linux reaches. #3711 —

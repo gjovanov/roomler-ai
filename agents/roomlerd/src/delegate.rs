@@ -811,6 +811,13 @@ const RECORD_SESSIONS_KEPT: usize = 1024;
 /// by opening sessions.
 const SESSION_ORGS_KEPT: usize = 1024;
 
+/// #4543 — how many sessions asked while no worker was attached a one-row
+/// Mac's daemon holds the params of ([`Inner::held_params`]). Oldest out: a
+/// session pushed out is served by the root daemon, as every such session was
+/// before #4543. Only a consent wait holds one, so a few are the most a real
+/// Mac ever holds at once.
+const HELD_PARAMS_KEPT: usize = 64;
+
 /// What the worker's signalling loop receives over the delegation channel.
 ///
 /// Two shapes, and the ORDER between them is load-bearing: params must land
@@ -1044,6 +1051,20 @@ fn note_session(
     }
 }
 
+/// #4543 — the params a one-row Mac's daemon resolved for a session while no
+/// worker was attached, held for that session's offer ([`Inner::held_params`]).
+struct HeldParams {
+    /// The session, as hex.
+    session: String,
+    /// The org that asked ([`org_key`]: `None` = the primary).
+    org: Option<String>,
+    /// The account the session was asked under: the one the supervisor had
+    /// started a worker for at the request, else the first it starts after it
+    /// ([`DelegateHost::started_for`]). `None` until then.
+    account: Option<u32>,
+    params: Box<SessionParams>,
+}
+
 /// #1882 — where a [`DelegateHost`] reads the overlay footprint it pushes to an
 /// attached worker: the overlay's v4 blocks as `(network, prefix length)`.
 pub type FootprintSource = fn() -> Vec<(std::net::Ipv4Addr, u8)>;
@@ -1086,7 +1107,8 @@ struct Inner {
     /// FR-43 P3b — which org handed each session to a worker (`None` = the
     /// primary), so its replies go back on that org's WS and no other org can
     /// reach into it. Written where a session's params cross
-    /// ([`DelegateHost::send_params`]). Kept across a transient detach, since
+    /// ([`DelegateHost::send_params`], or with its offer when they were held:
+    /// #4543, [`DelegateHost::send_to_worker`]). Kept across a transient detach, since
     /// the worker re-attaches with its sessions live and a session's org does
     /// not change with the process serving it; forgotten on
     /// [`DelegateHost::revoke`], like [`Inner::record_sessions`], because the
@@ -1150,6 +1172,15 @@ struct Inner {
     /// makes a record for one when its offer crosses. Bounded
     /// ([`SESSION_ORGS_KEPT`]), oldest out.
     keepable: Mutex<std::collections::VecDeque<String>>,
+    /// #4543 — on a one-row Mac's daemon, the params of each session asked
+    /// while no worker was attached ([`DelegateHost::hold`]). They cross at
+    /// the session's offer, first, to a worker of the account it was asked
+    /// under ([`DelegateHost::send_to_worker`]). Dropped when the root serves
+    /// that offer or the session ends ([`DelegateHost::served_here`]), when a
+    /// worker of another account is started ([`DelegateHost::started_for`]),
+    /// and on [`DelegateHost::revoke`]. Bounded ([`HELD_PARAMS_KEPT`]), oldest
+    /// out.
+    held_params: Mutex<std::collections::VecDeque<HeldParams>>,
     /// FR-138 P2b — where a worker's reply about a session the daemon keeps a
     /// record of goes: that record's link, in its org loop's table, which
     /// forwards it while attached and keeps what the server must hear while
@@ -1268,11 +1299,43 @@ impl DelegateHost {
     #[cfg(unix)]
     pub fn open_for(&self, uid: u32) -> String {
         let secret = self.mint();
-        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
+        self.started_for(uid);
         if let Err(e) = self.listen(uid) {
             tracing::warn!(uid, error = %e, "delegation: could not open the worker socket");
         }
         secret
+    }
+
+    /// The supervisor starts a worker for `uid`: noted as the account its
+    /// relay asks (#3864). #4543 — and a session held for an offer
+    /// ([`Self::hold`]) that was asked before any worker was started is now
+    /// that account's, while one asked under another account is dropped: its
+    /// offer is the root's. Run at every start, because a worker that ended by
+    /// itself is followed by the next one with no revoke between, and the next
+    /// may be another account's.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn started_for(&self, uid: u32) {
+        // Set first, and let go: `hold` reads it under the store's lock, so a
+        // session held at the same moment is bound to `uid` or bound below.
+        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        held.retain_mut(|h| match h.account {
+            None => {
+                h.account = Some(uid);
+                true
+            }
+            Some(account) if account == uid => true,
+            Some(account) => {
+                tracing::info!(
+                    session = %h.session,
+                    asked_under = account,
+                    started = uid,
+                    "delegation: a worker of another account was started; a session held for its \
+                     offer is the root daemon's (#4543)"
+                );
+                false
+            }
+        });
     }
 
     /// Bind the per-uid socket and serve attaches on it until [`revoke`].
@@ -1720,6 +1783,11 @@ impl DelegateHost {
     /// ([`Self::send_params`]): a session crosses on its own org's consent and
     /// no other. The primary off one row keeps P2's rule, where a session no
     /// org has handed over still crosses.
+    ///
+    /// #4543 — on one row, a session asked while no worker was attached
+    /// crosses at its offer: its held params first ([`Self::hold`]), then the
+    /// offer, both or neither, for the org that asked and to a worker of the
+    /// account it was asked under ([`Self::take_held`]).
     pub fn send_to_worker(&self, org: Option<&str>, msg: &ServerMsg) -> bool {
         let tx = self
             .inner
@@ -1742,6 +1810,11 @@ impl DelegateHost {
                 }
                 Some(_) => {}
                 None if org.is_some() || self.one_row() => {
+                    if matches!(msg, ServerMsg::SdpOffer { .. })
+                        && let Some(params) = self.take_held(org, &session)
+                    {
+                        return self.cross_held(held, &tx, org, session, params, msg);
+                    }
                     tracing::debug!(
                         %session,
                         kind = server_msg_kind(msg),
@@ -1870,6 +1943,10 @@ impl DelegateHost {
     /// Must reach the worker BEFORE the `SdpOffer` that consumes them. It does,
     /// because both travel the same ordered channel and the daemon resolves
     /// them while handling `Request`, which the server always sends first.
+    ///
+    /// #4543 — with no worker attached, a one-row Mac's daemon holds them
+    /// instead ([`Self::hold`]), and they cross with the session's offer
+    /// ([`Self::send_to_worker`]). Either way `false` here: nothing crossed yet.
     pub fn send_params(&self, org: Option<&str>, frame: DelegateFrame) -> bool {
         // FR-85 P1e-mac — remembered HERE, where the grant crosses, so the
         // relay's admission of a worker's `RecordingActivity` cannot drift from
@@ -1902,7 +1979,10 @@ impl DelegateHost {
             .lock()
             .expect("to_worker mutex")
             .clone();
-        let Some(tx) = tx else { return false };
+        let Some(tx) = tx else {
+            self.hold(org, frame);
+            return false;
+        };
         // Held across the crossing, so no other org's loop can note the same
         // session between the check and the note.
         let mut held = self.inner.sessions.lock().expect("sessions mutex");
@@ -1921,6 +2001,12 @@ impl DelegateHost {
             return false;
         }
         if let Some(session) = session {
+            // #4543 — handed over now: nothing of it stays held.
+            self.inner
+                .held_params
+                .lock()
+                .expect("held params mutex")
+                .retain(|h| h.session != session);
             note_session(&mut held, session, org);
         }
         drop(held);
@@ -1934,19 +2020,203 @@ impl DelegateHost {
             }
         }
         if let Some(session_id) = recorded {
-            let mut held = self
-                .inner
-                .record_sessions
-                .lock()
-                .expect("record sessions mutex");
-            if !held.iter().any(|s| *s == session_id) {
-                held.push_back(session_id);
-                while held.len() > RECORD_SESSIONS_KEPT {
-                    held.pop_front();
-                }
-            }
+            self.note_recorded(session_id);
         }
         true
+    }
+
+    /// FR-85 P1e-mac — `session` crossed with `RECORD` in its grant: its worker
+    /// may report on its recording ([`Self::records_session_of`]).
+    fn note_recorded(&self, session: String) {
+        let mut held = self
+            .inner
+            .record_sessions
+            .lock()
+            .expect("record sessions mutex");
+        if !held.iter().any(|s| *s == session) {
+            held.push_back(session);
+            while held.len() > RECORD_SESSIONS_KEPT {
+                held.pop_front();
+            }
+        }
+    }
+
+    /// #4543 — `frame`'s params, kept for its session's offer: a one-row Mac's
+    /// daemon with no worker attached at the request (after a reboot before
+    /// anyone signed in, across a log-out and log-in, just after a worker
+    /// ended). They cross with that offer when a worker of the account the
+    /// session was asked under is attached then ([`Self::send_to_worker`]).
+    /// Never `keepable`: the worker that will serve the session said nothing
+    /// at the request, and the daemon claims no such session (FR-138 P2b). A
+    /// session already handed over, or held for another org, is not held. Off
+    /// one row nothing is held, as before.
+    fn hold(&self, org: Option<&str>, frame: DelegateFrame) {
+        if !self.one_row() {
+            return;
+        }
+        let DelegateFrame::SessionParams(mut params) = frame else {
+            return;
+        };
+        params.keepable = false;
+        let session = params.session_id.clone();
+        // Held across, as `send_params` holds it: no other org's loop notes
+        // the session between this check and the hold.
+        let noted = self.inner.sessions.lock().expect("sessions mutex");
+        if let Some(owner) = owner_of(&noted, &session) {
+            if owner.as_deref() != org {
+                tracing::warn!(
+                    %session,
+                    org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                    "delegation: params for a session another org handed over; not held"
+                );
+            }
+            return;
+        }
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        if let Some(at) = held.iter().position(|h| h.session == session) {
+            if held[at].org.as_deref() != org {
+                tracing::warn!(
+                    %session,
+                    org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                    "delegation: params for a session another org asked for; not held (#4543)"
+                );
+                return;
+            }
+            // Asked again by the same org: its newest params stand.
+            held.remove(at);
+        }
+        // Read under the store's lock: a worker started at this moment binds
+        // this session after it is held, or is the account read here
+        // ([`Self::started_for`]).
+        let account = *self.inner.worker_uid.lock().expect("worker uid mutex");
+        held.push_back(HeldParams {
+            session: session.clone(),
+            org: org.map(str::to_string),
+            account,
+            params,
+        });
+        while held.len() > HELD_PARAMS_KEPT {
+            if let Some(out) = held.pop_front() {
+                tracing::info!(
+                    session = %out.session,
+                    "delegation: the oldest session held for its offer is let go; its offer is \
+                     the root daemon's (#4543)"
+                );
+            }
+        }
+        drop(held);
+        drop(noted);
+        tracing::info!(
+            %session,
+            org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+            account = ?account,
+            "delegation: no worker attached at the request; the session's params are held for \
+             its offer (#4543)"
+        );
+    }
+
+    /// #4543 — the held params of `session`, taken for its offer: only for the
+    /// org that asked, and only while the worker attached is one of the
+    /// account the session was asked under (a revoke leaves none). Anything
+    /// else leaves them, for [`Self::served_here`] to drop as the root serves
+    /// the offer.
+    fn take_held(&self, org: Option<&str>, session: &str) -> Option<Box<SessionParams>> {
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        let at = held.iter().position(|h| h.session == session)?;
+        if held[at].org.as_deref() != org {
+            tracing::warn!(
+                %session,
+                org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                "delegation: an offer for a session another org asked for; not crossing (#4543)"
+            );
+            return None;
+        }
+        let attached = *self.inner.worker_uid.lock().expect("worker uid mutex");
+        if held[at].account.is_none() || held[at].account != attached {
+            tracing::info!(
+                %session,
+                asked_under = ?held[at].account,
+                attached = ?attached,
+                "delegation: the worker attached is not of the account a held session was asked \
+                 under; served here (#4543)"
+            );
+            return None;
+        }
+        held.remove(at).map(|h| h.params)
+    }
+
+    /// #4543 — a held session's params, then its offer, onto the worker's
+    /// queue: two places reserved together, so both cross or neither does,
+    /// and in that order. The session is then noted for `org`, with its
+    /// `RECORD` grant, as one whose params crossed at the request is
+    /// ([`Self::send_params`]), and never as keepable.
+    fn cross_held(
+        &self,
+        mut noted: std::sync::MutexGuard<'_, std::collections::VecDeque<(String, Option<String>)>>,
+        tx: &tokio::sync::mpsc::Sender<DelegateFrame>,
+        org: Option<&str>,
+        session: String,
+        params: Box<SessionParams>,
+        msg: &ServerMsg,
+    ) -> bool {
+        let recorded = params
+            .permissions
+            .contains(roomler_ai_remote_control::permissions::Permissions::RECORD);
+        let Ok(mut places) = tx.try_reserve_many(2) else {
+            tracing::info!(
+                %session,
+                "delegation: the worker's queue has no room for a held session's params and \
+                 offer; served here (#4543)"
+            );
+            return false;
+        };
+        let (Some(first), Some(second)) = (places.next(), places.next()) else {
+            return false;
+        };
+        first.send(DelegateFrame::SessionParams(params));
+        second.send(DelegateFrame::ToWorker {
+            msg: Box::new(msg.clone()),
+        });
+        note_session(&mut noted, session.clone(), org);
+        drop(noted);
+        if recorded {
+            self.note_recorded(session.clone());
+        }
+        tracing::info!(
+            %session,
+            org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+            "delegation: a session asked while no worker was attached crosses at its offer, its \
+             params first (#4543)"
+        );
+        true
+    }
+
+    /// #4543 — the root daemon serves `msg` itself, for `org`: the gate let it
+    /// through to the daemon's own handlers. A held session's offer there, or
+    /// its end, drops its params, so a session whose offer the root took never
+    /// crosses later: moving a live peer is not this channel's job.
+    pub fn served_here(&self, org: Option<&str>, msg: &ServerMsg) {
+        let session = match msg {
+            ServerMsg::SdpOffer { session_id, .. } | ServerMsg::Terminate { session_id, .. } => {
+                session_id.to_hex()
+            }
+            _ => return,
+        };
+        let mut held = self.inner.held_params.lock().expect("held params mutex");
+        let Some(at) = held
+            .iter()
+            .position(|h| h.session == session && h.org.as_deref() == org)
+        else {
+            return;
+        };
+        held.remove(at);
+        drop(held);
+        tracing::info!(
+            %session,
+            kind = server_msg_kind(msg),
+            "delegation: the root daemon serves a held session's offer, or its end; its params \
+             are let go (#4543)"
+        );
     }
 
     /// FR-85 P1e-mac — the `record` caps this DEVICE should advertise, given
@@ -2061,6 +2331,13 @@ impl DelegateHost {
         // FR-138 P2b — and which sessions the daemon would have claimed: the
         // next worker never got their params.
         self.inner.keepable.lock().expect("keepable mutex").clear();
+        // #4543 — and the sessions held for their offers: asked under the
+        // worker that is gone, or before it, and the next is a new one.
+        self.inner
+            .held_params
+            .lock()
+            .expect("held params mutex")
+            .clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -2510,7 +2787,7 @@ impl DelegateHost {
     /// Unix's, and binds the worker's socket).
     #[cfg(test)]
     pub(crate) fn started_for_test(&self, uid: u32) {
-        *self.inner.worker_uid.lock().expect("worker uid mutex") = Some(uid);
+        self.started_for(uid);
     }
 
     /// #3992 — a worker's capabilities held as `serve` holds the ones its frame
@@ -6166,6 +6443,127 @@ mod one_row_attach_tests {
                 && is_offer_of(&crossed[1], session),
             "{crossed:?}"
         );
+    }
+
+    /// The store is bounded, oldest out: a session pushed out is served by the
+    /// root, as before #4543, and the rest still cross.
+    #[test]
+    fn the_sessions_held_for_their_offers_are_bounded_oldest_out() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let sessions: Vec<ObjectId> = (0..=HELD_PARAMS_KEPT).map(|_| ObjectId::new()).collect();
+        for session in &sessions {
+            assert!(!host.send_params(None, params(*session, Permissions::empty())));
+        }
+        assert_eq!(
+            host.inner.held_params.lock().unwrap().len(),
+            HELD_PARAMS_KEPT
+        );
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(sessions[0])),
+            "the oldest went first"
+        );
+        let newest = sessions[HELD_PARAMS_KEPT];
+        assert!(host.send_to_worker(None, &offer(newest)));
+        let crossed = drained(&mut worker);
+        assert!(
+            crossed.len() == 2 && is_params_of(&crossed[0], newest),
+            "{crossed:?}"
+        );
+    }
+
+    /// The root serving a held session's offer, or the session's end, lets its
+    /// params go, for that org only: a session whose offer the root took never
+    /// crosses later, and another org's word, or an ICE, changes nothing.
+    #[test]
+    fn a_held_session_the_root_served_or_that_ended_is_let_go() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let (served, ended, kept) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        for session in [served, ended, kept] {
+            assert!(!host.send_params(None, params(session, Permissions::empty())));
+        }
+        host.served_here(None, &offer(served));
+        host.served_here(
+            None,
+            &ServerMsg::Terminate {
+                session_id: ended,
+                reason: roomler_ai_remote_control::models::EndReason::AgentHangup,
+                limit: None,
+            },
+        );
+        host.served_here(Some("acme"), &offer(kept));
+        host.served_here(None, &ice(kept));
+        let mut worker = attach(&host);
+        assert!(
+            !host.send_to_worker(None, &offer(served)),
+            "the root took its offer"
+        );
+        assert!(!host.send_to_worker(None, &offer(ended)), "it ended");
+        assert!(
+            host.send_to_worker(None, &offer(kept)),
+            "another org's offer of it, and an ICE, let nothing go"
+        );
+        let crossed = drained(&mut worker);
+        assert!(
+            crossed.len() == 2 && is_params_of(&crossed[0], kept) && is_offer_of(&crossed[1], kept),
+            "{crossed:?}"
+        );
+    }
+
+    /// Off one row nothing is held: the primary keeps P2's rule, where an offer
+    /// crosses with no params, as before #4543.
+    #[test]
+    fn off_one_row_nothing_is_held() {
+        let host = DelegateHost::new();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        assert!(host.inner.held_params.lock().unwrap().is_empty());
+        let mut worker = attach(&host);
+        assert!(host.send_to_worker(None, &offer(session)));
+        let crossed = drained(&mut worker);
+        assert!(
+            matches!(crossed.as_slice(), [f] if is_offer_of(f, session)),
+            "the offer alone: {crossed:?}"
+        );
+    }
+
+    /// The params and the offer cross both or neither: a queue with room for
+    /// one leaves the offer to the root, and nothing of it on the queue.
+    #[test]
+    fn a_held_session_crosses_with_its_offer_or_not_at_all() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        let (tx, mut worker) = tokio::sync::mpsc::channel(2);
+        tx.try_send(DelegateFrame::Ping).unwrap();
+        *host.inner.to_worker.lock().unwrap() = Some(tx);
+        assert!(
+            !host.send_to_worker(None, &offer(session)),
+            "no room for both: served here"
+        );
+        let left = drained(&mut worker);
+        assert!(
+            matches!(left.as_slice(), [DelegateFrame::Ping]),
+            "nothing of it crossed: {left:?}"
+        );
+        assert!(host.owner_of_reply(&reply(session)).is_none());
+    }
+
+    /// A session whose params crossed at a later request, a worker attached
+    /// then, is held no more: the store keeps only sessions not handed over.
+    #[test]
+    fn a_session_handed_over_at_a_later_request_is_held_no_more() {
+        let host = one_row_host();
+        host.started_for_test(PERSON);
+        let session = ObjectId::new();
+        assert!(!host.send_params(None, params(session, Permissions::empty())));
+        let _worker = attach(&host);
+        assert!(host.send_params(None, params(session, Permissions::empty())));
+        assert!(host.inner.held_params.lock().unwrap().is_empty());
     }
 
     /// #4543, end to end on the daemon's side: a one-row Mac's real org loop
