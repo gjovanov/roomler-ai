@@ -297,6 +297,36 @@ pub fn flag_value(value: Option<&str>, default: bool) -> bool {
     }
 }
 
+/// FR-156's device switches, by suffix: P1's `LIVE_WORK_PROOF`, and P2-P4 add
+/// theirs here. Each is a default-ON kill switch, read with
+/// [`flag`]`(suffix, true)` and turned off by `ROOMLERD_<suffix>=0`.
+///
+/// Each process reads them from its own environment, and on Windows the worker
+/// a service starts as the person runs in the person's environment, which holds
+/// none of the service's. So the service hands each one it reads on to that
+/// worker ([`worker_switches`]), and the two read the same.
+pub const LIVE_WORK_SWITCHES: &[&str] = &["LIVE_WORK_PROOF"];
+
+/// FR-156 P1c — the [`LIVE_WORK_SWITCHES`] this process reads from a value set
+/// in its environment, as the variables a child it starts needs to read them
+/// the same way: each under the current spelling, `ROOMLERD_<suffix>`, with
+/// `1` or `0` for what [`flag`] makes of the value. `read` answers for a full
+/// variable name; the Windows service passes its own environment.
+///
+/// A switch is set when [`node_env`]'s chain finds a value under one of
+/// [`PREFIXES`], the first found winning as there. A retired spelling is not
+/// read, so it is not handed on, and neither is a config-backed fallback, which
+/// is not an environment value. A switch set nowhere is left out, so a host that
+/// sets none hands on nothing and starts its child as before.
+///
+/// The current spelling is the first arm of the child's own chain, so a value
+/// the child already has under an older spelling cannot outrank it.
+pub fn worker_switches(read: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    // The seam: nothing is handed on yet.
+    let _ = read;
+    Vec::new()
+}
+
 /// OsString twin of [`node_env`] for reads that must tolerate non-Unicode
 /// values (`std::env::var_os` semantics). Same precedence, and it MUST stay the
 /// same: two readers of one knob that disagree about which prefix wins is a
@@ -762,6 +792,88 @@ mod tests {
     /// subscriber, not the once-per-variable rule this asserts.
     fn warned(prefix: &str, suffix: &str) -> bool {
         super::legacy_use_is_new(prefix, suffix)
+    }
+
+    // ── FR-156 P1c: the switches a Windows service hands to its worker ───────
+
+    /// A process environment holding `vars` and nothing else, as the reader
+    /// [`worker_switches`] takes. These cells never `set_var`: they run in
+    /// parallel, and edition 2024 makes it unsafe.
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name: &str| vars.get(name).cloned()
+    }
+
+    /// The variable the live-work switch is handed on as.
+    fn handed(value: &str) -> (String, String) {
+        ("ROOMLERD_LIVE_WORK_PROOF".to_string(), value.to_string())
+    }
+
+    /// FR-156 P1c-1 — a service that reads the switch off hands it on off,
+    /// whichever off word it was set with.
+    #[test]
+    fn a_switch_the_service_reads_off_is_handed_on_off() {
+        for off in ["0", "false", "Off", " no "] {
+            let got = worker_switches(env_of(&[("ROOMLERD_LIVE_WORK_PROOF", off)]));
+            assert_eq!(got, [handed("0")], "{off:?}");
+        }
+    }
+
+    /// FR-156 P1c-2 — a service that sets no switch hands on nothing, and so
+    /// starts its worker as before: every host today. Its other knobs are not
+    /// handed on either.
+    #[test]
+    fn a_service_that_sets_no_switch_hands_on_nothing() {
+        let got = worker_switches(env_of(&[]));
+        assert!(got.is_empty(), "{got:?}");
+        let others = env_of(&[("ROOMLERD_ELEVATE_WORKER", "0"), ("PATH", r"C:\Windows")]);
+        let got = worker_switches(others);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// FR-156 P1c-2b — a retired spelling is not read, so it switches nothing
+    /// off in the service, and nothing is handed on.
+    #[test]
+    fn a_retired_spelling_alone_hands_on_nothing() {
+        let retired = format!("{}LIVE_WORK_PROOF", RETIRED_PREFIXES[0]);
+        let got = worker_switches(env_of(&[(retired.as_str(), "0")]));
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// FR-156 P1c-3 — set under an older spelling the chain still reads, the
+    /// switch is handed on under the current one, which the worker reads first.
+    #[test]
+    fn an_older_spelling_is_handed_on_under_the_current_one() {
+        let older = format!("{}LIVE_WORK_PROOF", PREFIXES[1]);
+        let got = worker_switches(env_of(&[(older.as_str(), "0")]));
+        assert_eq!(got, [handed("0")]);
+    }
+
+    /// FR-156 P1c-3b — with both spellings set, the value handed on is the one
+    /// the service itself reads: the current spelling's, as in [`node_env`].
+    #[test]
+    fn with_both_spellings_set_the_current_ones_value_is_handed_on() {
+        let older = format!("{}LIVE_WORK_PROOF", PREFIXES[1]);
+        for (current, old, want) in [("1", "0", "1"), ("0", "1", "0")] {
+            let got = worker_switches(env_of(&[
+                ("ROOMLERD_LIVE_WORK_PROOF", current),
+                (older.as_str(), old),
+            ]));
+            assert_eq!(got, [handed(want)], "current {current}, older {old}");
+        }
+    }
+
+    /// FR-156 P1c-4 — any value but an off word keeps a default-ON switch on, in
+    /// the service as in [`flag`], so it is handed on as `1`, an empty value too.
+    #[test]
+    fn any_value_but_an_off_word_is_handed_on_as_on() {
+        for on in ["yes", "1", "TRUE", "on", "", "weird"] {
+            let got = worker_switches(env_of(&[("ROOMLERD_LIVE_WORK_PROOF", on)]));
+            assert_eq!(got, [handed("1")], "{on:?}");
+        }
     }
 }
 

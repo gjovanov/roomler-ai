@@ -3060,6 +3060,31 @@ pub unsafe fn spawn_into_job(
     })
 }
 
+/// FR-156 P1c — the variables laid over the person's own block for the worker
+/// this service starts as the person: each live-work switch the service reads
+/// from a value set in its own environment (its `Environment`, or the machine
+/// environment it was started with), under the current spelling, with the value
+/// the service's own read gives it ([`tunnel_core::env::worker_switches`]).
+///
+/// The person's block ([`EnvBlock::for_token`]) holds none of the service's
+/// environment. Without this, `set-service-env-var` turning a switch off would
+/// reach the service and not its worker. For `ROOMLERD_LIVE_WORK_PROOF` that is
+/// the service's SSH server (port 2223) sending no keepalives while the worker
+/// still counts only a connection heard from within its window: an idle SYSTEM
+/// session through 2223 stops counting, and an update cuts it. A value set only
+/// where the worker reads it and the service does not (the machine environment
+/// after boot, the person's own) still reaches the worker alone, which leaves
+/// the keepalives on and the counting off, the safe way round.
+///
+/// Empty when the service sets none of them, and the worker's spawn is then
+/// today's ([`spawn_in_session`]).
+fn worker_env(read: impl Fn(&str) -> Option<String>) -> Vec<(OsString, OsString)> {
+    tunnel_core::env::worker_switches(read)
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect()
+}
+
 /// A `STARTUPINFOEXW` whose handle list bounds inheritance to the handles
 /// given, and only those.
 pub(crate) struct InheritOnly {
@@ -4103,6 +4128,24 @@ mod tests {
                 "{name:?}={value:?} must be refused"
             );
         }
+    }
+
+    /// FR-156 P1c-5 — the live-work switch the service hands on replaces the
+    /// person's own of that name however it is cased, as Windows compares names,
+    /// so the worker's block holds one entry of it: the service's.
+    #[test]
+    fn the_services_live_work_switch_replaces_the_persons_own() {
+        let env = worker_env(|name| (name == "ROOMLERD_LIVE_WORK_PROOF").then(|| "0".to_string()));
+        let base = vec![wide(r"Path=C:\Windows"), wide("roomlerd_live_work_proof=1")];
+        let block = merge_env_block(base, &env).unwrap();
+        let named: Vec<String> = entries_of(&block)
+            .into_iter()
+            .filter(|e| {
+                e.to_ascii_uppercase()
+                    .starts_with("ROOMLERD_LIVE_WORK_PROOF=")
+            })
+            .collect();
+        assert_eq!(named, ["ROOMLERD_LIVE_WORK_PROOF=0"]);
     }
 
     /// FR-90 P1i — the process is in its job, and sees the session's variable
