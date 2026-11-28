@@ -354,7 +354,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Standard,
         live: false,
         kind: "bool",
-        description: "Auto-detect and advertise directly-connected IPv4 subnets (untrusted until admin-approved). Default: on.",
+        description: "Suggest this machine's local networks as tunnel routes. An administrator sees them under the device's Tunnel mesh routes. Nothing on those networks can be reached through this machine until an administrator approves a route. Default: on.",
     },
     KeyMeta {
         key: "auto_grant_session",
@@ -362,7 +362,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Essential,
         live: false,
         kind: "bool",
-        description: "Auto-approve incoming remote-control session requests without an operator prompt. Default: on.",
+        description: "Trust the organization's consent policy (no extra prompt on this machine). Sessions the policy lets in without asking start without asking here: the owner's own (whoever approves this device), an administrator's Force control, and every session once this device is set to Auto-grant. Everyone else is asked at this screen. Whoever is here sees a notice with Disconnect while someone is viewing. Default: on.",
     },
     KeyMeta {
         key: "enable_remote_browse",
