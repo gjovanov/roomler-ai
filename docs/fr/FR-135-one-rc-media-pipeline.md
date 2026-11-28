@@ -699,7 +699,7 @@ The anchors live in `rc-media-debt.tsv` under `CellTable`. Each is a reason for 
 |---|---|---|
 | 10-bit HEVC, AV1 | **Out, own FR with HDR** (D10) | Capture is 8-bit BGRA and FP16 is tone-clipped; every converter is 8-bit BT.601 limited with a compile-time assertion. New GPU conversion, description set, workers. A 10-bit SDR cell buys banding only |
 | AV1 4:4:4 | Retire from consideration | No hardware encoder; software means libaom or SVT-AV1, neither built |
-| HEVC 4:4:4 on QSV | **Build the field test** | FR-77 AC P3 has named it since 2026-09-08. The `444` child contains the fault. Run on an Iris Xe class host; leaves the list only on a pass |
+| HEVC 4:4:4 on QSV | **Build the field test** | **AC22** carries it: FR-77's P3 named it on 2026-09-08 and moved here when FR-77 closed on 2026-11-28. The `444` child contains the fault. Run on an Iris Xe class host; leaves the list only on a pass |
 | HEVC 4:4:4 on AMF; H.264 4:4:4 outside NVENC; VP9 profile 1 hardware | Retire | No surface on AMF; x264 is GPL; `vp9_qsv` costs 23.7 ms and decode is software anyway |
 | NVENC 4:4:4 GPU form | **Build and measure, after R5** | Sharper is the default, so a hardware pair lands on HEVC 4:4:4 and misses FR-118's saving; 10-23 % of its stage is conversion [M FR-118 §9.5] |
 | VVC, HEVC SCC | Retire from consideration | No encoder in the vendored FFmpeg |
@@ -1506,6 +1506,7 @@ I ran each spike that was cheap and could change the design, with one miss: the 
 - [ ] **AC19 (docs):** `docs/remote-control.md` (the graph, stages, ladder, `rc:media-plan`), `docs/encoders.md` (`CellTable` and proof), `docs/rate-control.md` (the order and the ceiling), `docs/testing.md` (the instruments), and a new `docs/rc-media-pipeline.md` in house style, with mermaid and `file:line` anchors, with a row in `docs/README.md`'s index.
 - [ ] **AC20 (idle spend):** §3.5's idle row reads within its target on every session-proven cell, or D14's answer names who owes it and until when. Time to crisp no worse.
 - [x] **AC21 (a roll):** §3.5's row for a session ended with the host healthy reads within its target, or D15's answer names who owes it. **Met (§3.5, §13 2026-11-14):** D15's answer, C, named [FR-138](FR-138-the-session-outlives-its-control-socket.md) (#3604), closed on 2026-11-13, and the row now reads within its target: a roll keeps an in-scope session on its row.
+- [ ] **AC22 (FR-77's P3, moved here from #1470):** the FR-74 Notepad++ scroll on each cell FR-77 added, operator-judged, with the cell's ceiling factor recorded. HEVC 4:4:4 on QSV leaves the denylist only on a pass of §5.8's field test on an Iris Xe class host; on a fail it stays denied, and the result is recorded in §5.8 and §13. Carried from FR-77's field log: no cell's scroll is judged. One cell ran and has its factor: H.264 4:4:4 on `h264_nvenc`, a session end to end on 2026-09-08 with software decode, its ceiling at the direct ceiling × 150 % (H.264) × 150 % (the chroma column's built-in value). Owed: the scroll on that cell; HEVC 4:4:4 on QSV and on VAAPI and VP9 4:4:4 on QSV and on VAAPI, all four denied by default and none opened in a session. VP9 4:4:4 on QSV faulted in the probe's child at its first open on 2026-09-08, and §5.8 retires VP9 profile 1 hardware, so a VP9 cell owes its scroll only if it is kept.
 
 ## 10. Decisions for the operator
 
