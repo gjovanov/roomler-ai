@@ -1069,7 +1069,7 @@ sequenceDiagram
 
     Note over S: the server ends the session
     S->>X: rc:tunnel.terminate { close_connection: true }
-    Note over X: AgentQuicPeer::end — flows stop, connection closed (code 2)
+    Note over X: AgentQuicPeer::end — connection closed (code 2), then flows stop
     S->>C: tells the client
     C->>S: ack (rc:tunnel.terminate)
     S->>X: rc:tunnel.terminate { close_connection: true } (relayed)
@@ -1081,12 +1081,13 @@ sequenceDiagram
 `terminate_quic_session` (`:6726`):
 
 - **with the flag**, `AgentQuicPeer::end` (`agents/roomlerd/src/tunnel/quic_peer.rs:590`):
-  every flow stops, its two halves aborted, which drops its destination socket and
-  its streams; the connection closes with application code `2` (`SESSION_END_CODE`,
-  `:58`, reason `session ended`, distinct from a failed auth's `1`); the endpoint
-  closes and the accept loop stops. The endpoint's UDP socket, and on the relayed
-  flavours the TURN allocation, go once the closed connection drains. A peer R3
-  parked and reclaimed is ended the same way;
+  the connection closes with application code `2` (`SESSION_END_CODE`, `:58`, reason
+  `session ended`, distinct from a failed auth's `1`); then every flow stops, its two
+  halves aborted, which drops its destination socket and its streams. The close goes
+  first, so each flow's client reads the end as that close and never as a finished
+  stream (`SessionLink::end`, `:123`). The endpoint closes and the accept loop stops.
+  The endpoint's UDP socket, and on the relayed flavours the TURN allocation, go once
+  the closed connection drains. A peer R3 parked and reclaimed is ended the same way;
 - **without it**, `AgentQuicPeer::close`, and the session's `SessionLink` is kept in
   `ENDED_QUIC_SESSIONS` (`agents/roomlerd/src/signaling.rs:6700`) for 60 s
   (`ENDED_SESSION_TTL`, at most 64 sessions a tenant, the oldest first out). A
