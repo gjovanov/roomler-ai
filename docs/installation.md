@@ -4502,7 +4502,7 @@ follows the same rule: its note is in
 | the companion | stderr | `agents/roomler-desktop/src/desktop_log.rs:143` | the same function |
 | the Setup wizard | stderr | `agents/roomler-setup/src/main.rs:77` | the same function, as `roomlerd::logging::colour` |
 | the CLI: `roomler`, and `roomlerd cli` behind the `roomler` shim | stdout | `agents/roomler-cli/src/cli.rs:890` | a copy (`agents/roomler-cli/src/cli.rs:1288`) |
-| the DERP relay | stdout | `crates/derp-relay/src/main.rs:575` | a copy (`crates/derp-relay/src/main.rs:1142`) |
+| the DERP relay | stdout | `crates/derp-relay/src/main.rs:921` | a copy (`crates/derp-relay/src/main.rs:1563`) |
 | the server | stdout | `crates/api/src/main.rs:27` | `crates/api/src/logging.rs:58` |
 
 The rule has four homes, word for word, each with the same table test
@@ -4571,5 +4571,5 @@ and the codes with colour on: the daemon's compact layer on stdout and through t
 log-file branch's filtered writer, #3230 (`crates/agent-core/src/logging.rs:2706`,
 `:2711`, `:2717`), the companion (`agents/roomler-desktop/src/desktop_log.rs:333`), the
 CLI (`agents/roomler-cli/src/cli.rs:1864`) and the relay
-(`crates/derp-relay/src/main.rs:2215`). The wizard's binary has no tests (`test = false`,
+(`crates/derp-relay/src/main.rs:2645`). The wizard's binary has no tests (`test = false`,
 the UAC naming rule), so its chain is read, not run.

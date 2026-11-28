@@ -358,7 +358,7 @@ roll. Both at 0 is the crate's default `ConnectionManager` with no outer timeout
 replacement, restored by a setting on the deployment and a restart, with no new image
 (`crates/config/src/settings.rs:1369-1381`). The boot line `Redis Pub/Sub publisher connected`
 names the bounds in use, `response_timeout_ms` and `connection_timeout_ms` (0 is no bound), and
-`addr`, Redis's host and port (`crates/core/src/ws/redis_pubsub.rs:465-479`).
+`addr`, Redis's host and port (`crates/core/src/ws/redis_pubsub.rs:531-545`).
 
 The crate's own response timeout does not cover the wait for a reconnect or the queue in front of
 the socket, so each call runs under an outer timeout of the same length. A timed-out command does
@@ -421,9 +421,9 @@ whatever its cause, and what heals a write applied behind a lost reply, or one t
 | Redis user | Commands | On an error | A write applied behind the lost reply |
 |---|---|---|---|
 | Fan-out on `roomler:ws` (`crates/core/src/ws/dispatcher.rs:59`, `:87`, `:141`) | PUBLISH | logged; users on other pods miss that one event (at-most-once, never retried); the request that sent it still answers (a chat post: 200 in 3.0 s) | delivered: nothing to heal |
-| Online registry (`crates/core/src/ws/redis_pubsub.rs:110`, `:129`) | SADD + EXPIRE, SREM | logged; the 30 s heartbeat (`crates/api/src/state.rs:449`) writes it again | the 90 s TTL |
+| Online registry (`crates/core/src/ws/redis_pubsub.rs:110`, `:129`) | SADD + EXPIRE, SREM | logged; the 30 s heartbeat (`crates/api/src/state.rs:462`) writes it again | the 90 s TTL |
 | Push gate (`crates/core/src/notify.rs:39`) | EXISTS | read as offline: the web push (and a mention's email) is sent | — |
-| Agent presence (`crates/modules/fleet/src/socket.rs:482`, `:1024`, `:1097`, `:1101`; `presence.rs:281`) | SET EX 90, compare-DEL, EXISTS, MGET | logged; a teardown announces the device offline and the next sweep (≤ 30 s) corrects it; the sweep skips a cycle | the next heartbeat, or the 90 s TTL |
+| Agent presence (`crates/modules/fleet/src/socket.rs:482`, `:1025`, `:1098`, `:1102`; `presence.rs:281`) | SET EX 90, compare-DEL, EXISTS, MGET | logged; a teardown announces the device offline and the next sweep (≤ 30 s) corrects it; the sweep skips a cycle | the next heartbeat, or the 90 s TTL |
 | Cycle claims (`try_claim`, `redis_pubsub.rs:247`: alerts, org daily, stats rollup, presence sweep, ephemeral reaper, relay allowance, RC resume sweep, SaaS pulls) | SET NX EX | that pod skips the cycle | the claim is held and run by nobody until its TTL ends: one cycle (the org daily: that day's run, recomputed the next day) |
 | TURN usage dedupe (`crates/core/src/turn_bytes.rs:101`) | SET NX EX 7 d | warn, the total is not booked | **lasting**: that total is never booked |
 | Relay load baseline (`crates/core/src/relay_load.rs:521`) | advance_baseline (Lua) | logged, the poll goes on | **lasting**: that delta is never booked |
@@ -447,7 +447,7 @@ is bounded; the sum is k × 3 s.
 #### The subscriptions (#3952)
 
 The fan-out on `roomler:ws`, the pod bus on `roomler:pod:<pod>` and TURN usage on coturn's
-statistics each subscribe on a connection of their own (`redis_pubsub.rs:442`,
+statistics each subscribe on a connection of their own (`redis_pubsub.rs:508`,
 `crates/core/src/cluster/bus.rs:270`, `crates/modules/network/src/turn_usage.rs:100`). A subscribed
 connection is asked nothing, so neither bound above sees it go silent, and the crate gives it no
 ping: a subscriber whose Redis went silent without a reset would stay subscribed to nothing until
@@ -467,7 +467,7 @@ each subscriber proves its own connection, end to end (`crates/core/src/ws/sub_p
   waits for it.
 - **Deaf.** The subscription is dropped, which closes its socket and ends the crate's driver task
   for it at once, and the subscriber's own loop subscribes again on a new connection 1 s later
-  (`redis_pubsub.rs:399-429`, `bus.rs:130-150`, `turn_usage.rs:149-165`): break-before-make, so
+  (`redis_pubsub.rs:465-495`, `bus.rs:130-150`, `turn_usage.rs:149-165`): break-before-make, so
   nothing is delivered twice.
 - **Every subscribe is bounded** (`within`, `sub_probe.rs:213`): the connect, TCP and the handshake,
   by the connection timeout, and each SUBSCRIBE by the response timeout. A probe SUBSCRIBE that gets
@@ -511,10 +511,10 @@ Why a Redis that answers, however slowly, does not trip it:
 
 | Subscriber | A subscribe that gets no answer | A subscription gone deaf |
 |---|---|---|
-| Fan-out, `roomler:ws` (`redis_pubsub.rs:399`) | fails after the connection timeout (the connect) or the response timeout (each SUBSCRIBE), and is tried again | found and subscribed again within the bound below; `redis_sub_alive`, so `/health/ready`, is false from the verdict to the new subscription |
+| Fan-out, `roomler:ws` (`redis_pubsub.rs:465`) | fails after the connection timeout (the connect) or the response timeout (each SUBSCRIBE), and is tried again | found and subscribed again within the bound below; `redis_sub_alive`, so `/health/ready`, is false from the verdict to the new subscription |
 | Pod bus, `roomler:pod:<pod>` (`bus.rs:263`) | the same | the same; its `sub_alive` is not part of readiness |
 | TURN usage, coturn's statistics (`turn_usage.rs:124`) | the same | the same; each total is handed to a recorder task (`hand_over`, `:76`, a queue of 4096), so a slow MongoDB cannot hold the probe |
-| The DERP relay's statistics (`crates/derp-relay/src/main.rs:420`) | fails after 3 s (`STATS_REDIS_BOUND`, `:400`), at the connect and at each PSUBSCRIBE, and is tried again | not probed: at a PoP its Redis runs on the same host, so a connection gone deaf there is a frozen Redis, which coturn cannot publish to either |
+| The DERP relay's statistics (`crates/derp-relay/src/main.rs:737`) | fails after 3 s (`STATS_REDIS_BOUND`, `:717`), at the connect and at each PSUBSCRIBE, and is tried again | not probed: at a PoP its Redis runs on the same host, so a connection gone deaf there is a frozen Redis, which coturn cannot publish to either |
 
 **The bound.** Once the command connection answers, a deaf subscriber is found within three
 intervals, 45 s at the default (two, when Redis answers its probe with 0 receivers, as it does once

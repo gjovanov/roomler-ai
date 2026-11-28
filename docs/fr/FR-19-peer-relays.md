@@ -250,7 +250,7 @@ population this FR targets* — can take the slot. A stolen bind black-holes the
 receives the counterparty's ciphertext, and injects arbitrary UDP at its WireGuard socket.
 
 ⚠️ The first draft also cited the key-equality assertion on DERP registration (then in
-`crates/api/src/ws/derp.rs`, now `crates/modules/network/src/derp.rs:591`) as the precedent to
+`crates/api/src/ws/derp.rs`, now `crates/modules/network/src/derp.rs:592`) as the precedent to
 copy — but that check works **because the WebSocket underneath it is already authenticated**
 by the agent JWT (`crates/modules/network/src/derp.rs:342` `verify_agent_token`, `:354` tenant
 match, `:401` refusal check). Copying the assertion without the channel copies

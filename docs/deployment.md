@@ -537,6 +537,12 @@ The multi-pod design is settled and documented in
     The regional PoPs leave it unset and serve every network. Set but empty or
     malformed, the relay refuses to start
     ([`scripts/relay-pop/README.md`](../scripts/relay-pop/README.md)).
+  - `DERP_FLOORS_FILE` (FR-155 P1e) is where a relay keeps the generation floors
+    the API pushes it, written on every change and read at the start, so a
+    restart holds them before the API's first push. The PoP compose file sets
+    it to a file on the host's `/opt/relay-pop/state`. Unset, the floors are
+    kept in memory only, which the start logs. Every PoP rolls before the API's
+    pods ([the roll](../scripts/relay-pop/README.md#generation-floors-fr-155-p1e)).
   - Its log lines are coloured only when stdout is a terminal (#3938), so what a
     PoP's container or a unit's journal stores is plain text
     ([installation.md](installation.md#console-lines-colour-only-on-a-terminal-3938)).
