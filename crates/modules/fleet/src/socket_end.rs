@@ -17,8 +17,16 @@
 //! socket ended.
 
 use axum::extract::ws::CloseFrame;
+use bson::oid::ObjectId;
+use roomler_ai_remote_control::ws_close::UNUSED_HANDOVER_PROBE;
+use tracing::{debug, warn};
 
 use crate::hub::CancelReason;
+
+/// The target of the two lines [`SocketEnd::log_before_hello`] writes: the
+/// socket module's. The warning was written there until FR-22 P5a, and a
+/// filter set on that module must go on reading it.
+const BEFORE_HELLO_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::socket");
 
 /// How one agent socket's read loop ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +133,44 @@ impl SocketEnd {
             SocketEnd::Cancelled(reason) => Some(reason.map_or("unknown", CancelReason::label)),
             _ => None,
         }
+    }
+
+    /// FR-22 P5a — a close frame with the reason of a hand-over probe the
+    /// device did not use. Equality, never a prefix: any other text is some
+    /// other end.
+    pub(crate) fn is_unused_handover_probe(&self) -> bool {
+        self.reason() == Some(UNUSED_HANDOVER_PROBE)
+    }
+
+    /// The line for a socket that ended before its `rc:agent.hello` (#3517).
+    /// Nothing registered for it, so no disconnect line follows, and this one
+    /// says how it ended, with the same fields.
+    ///
+    /// FR-22 P5a — one such end is expected: a hand-over probe the device did
+    /// not need, which every device sends at a network change. It is written
+    /// at debug. Every other end is the warning it has been, byte for byte.
+    pub(crate) fn log_before_hello(&self, agent_id: ObjectId) {
+        if self.is_unused_handover_probe() {
+            debug!(
+                target: BEFORE_HELLO_TARGET,
+                %agent_id,
+                cause = %self.cause(),
+                code = self.code(),
+                reason = self.reason(),
+                "agent WS closed before its hello: an unused hand-over probe"
+            );
+            return;
+        }
+        warn!(
+            target: BEFORE_HELLO_TARGET,
+            %agent_id,
+            cause = %self.cause(),
+            code = self.code(),
+            reason = self.reason(),
+            kind = self.kind().map(tracing::field::display),
+            error = self.error(),
+            "agent opened WS without rc:agent.hello — closing"
+        );
     }
 }
 
@@ -314,5 +360,34 @@ mod tests {
                 detail: e.to_string(),
             }
         );
+    }
+
+    /// FR-22 P5a — the probe is told by its reason, whole. A reason that only
+    /// starts like it, a close with no frame and a stream's end are other ends.
+    #[test]
+    fn an_unused_handover_probe_is_told_by_its_whole_reason() {
+        let close = |reason: &str| {
+            SocketEnd::of_close(Some(CloseFrame {
+                code: 1000,
+                reason: reason.into(),
+            }))
+        };
+        assert!(close(UNUSED_HANDOVER_PROBE).is_unused_handover_probe());
+        for other in [
+            String::new(),
+            format!("{UNUSED_HANDOVER_PROBE}-x"),
+            UNUSED_HANDOVER_PROBE[..UNUSED_HANDOVER_PROBE.len() - 1].to_owned(),
+            UNUSED_HANDOVER_PROBE.to_uppercase(),
+        ] {
+            assert!(!close(&other).is_unused_handover_probe(), "{other:?}");
+        }
+        assert!(!SocketEnd::of_close(None).is_unused_handover_probe());
+        assert!(!SocketEnd::StreamEnd.is_unused_handover_probe());
+    }
+
+    /// The two lines before a hello keep the socket module's target.
+    #[test]
+    fn the_lines_before_a_hello_keep_the_socket_modules_target() {
+        assert_eq!(format!("{BEFORE_HELLO_TARGET}_end::tests"), module_path!());
     }
 }

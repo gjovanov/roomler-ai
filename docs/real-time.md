@@ -1064,7 +1064,7 @@ INFO roomler_ai_mod_fleet::socket: remote-control agent WS disconnected agent_id
 ```
 
 Each exit of the read loop (`socket.rs:581`) breaks with a `SocketEnd`
-(`crates/modules/fleet/src/socket_end.rs:25`), so an exit added later does not compile
+(`crates/modules/fleet/src/socket_end.rs:33`), so an exit added later does not compile
 until it names its cause. `cause` is always on the line. Every other field appears only
 with the cause it belongs to, so the line never carries a field that means nothing for
 its end. Before #3517 the line carried the agent id alone, and a close frame or a reset
@@ -1107,7 +1107,7 @@ read-loop`, carries the same `by`.
 | `rotated` | the device's token rotated (FR-155), and this connection was admitted below the new generation (`Hub::end_below_generation`, `crates/modules/fleet/src/hub/rotation.rs:244`): on the pod the rotation reached, on another through the control channel's `end_below_generation` (`ctrl.rs:284`), or, while the rotation is on, in any pod's own check of its entries against their rows' generations, once a period of `rc.presence_sweep_secs` (`generation_check::run`, `crates/modules/fleet/src/generation_check.rs:57`, FR-155 P1c). Nothing is sent to the device first |
 | `unknown` | a cancel with no trigger recorded. Nothing fires one today |
 
-`kind`, for `cause=error` (`error_kind`, `socket_end.rs:138`):
+`kind`, for `cause=error` (`error_kind`, `socket_end.rs:184`):
 
 | `kind` | what the transport under the socket said |
 |---|---|
@@ -1134,6 +1134,18 @@ so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1402`)
 how it ended on its own warn line, `agent opened WS without rc:agent.hello — closing`,
 with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
 `other=None` for every end.
+
+One end before the hello is expected, and writes no warning (FR-22 P5a). At a network
+change a device opens a replacement control socket beside the one it has, up to the
+upgrade's answer, and says no hello on it. When it does not need the replacement, because
+the socket it had answered first, it closes it with the reason `handover-probe-unused`
+(`UNUSED_HANDOVER_PROBE`, `crates/remote_control/src/ws_close.rs:18`). That end is one
+debug line, `agent WS closed before its hello: an unused hand-over probe`, with `cause`,
+`code` and `reason`, under the same target as the warning
+(`SocketEnd::log_before_hello`, `crates/modules/fleet/src/socket_end.rs:152`). The reason
+is compared whole, so a text that only starts like it is still the warning. ⚠️ Until a
+daemon that sends the probe is released, no device closes with that reason, and the debug
+line never appears.
 
 **At the registration (FR-155).** A socket refused at its registration registered nothing
 either, and gets no disconnect line; its own line says why. `refusing agent WS: below the

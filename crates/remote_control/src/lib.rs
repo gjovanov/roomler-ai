@@ -57,6 +57,9 @@ pub mod turn_url;
 /// the server, the regional relay and both clients alike.
 pub mod upgrade_auth;
 pub mod worker_pick;
+/// FR-22 P5a — what a control socket's close frame says when the socket was
+/// a hand-over probe that was not used. The agent writes it, the server reads it.
+pub mod ws_close;
 
 pub use error::{Error, Result};
 pub use models::{Agent, AgentStatus, RemoteSession, SessionPhase};
