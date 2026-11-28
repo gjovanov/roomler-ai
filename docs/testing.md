@@ -25,6 +25,7 @@ flowchart TB
 | Agent library | `cargo test -p roomlerd --lib` | nothing (default features) |
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux. The tests that write the real clipboard or change an X display skip unless opted in ([below](#tests-that-change-a-real-desktop-3813)) |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
+| Vendored webrtc's own tests | `bash scripts/vendored-webrtc-test.sh` | nothing: the fork builds on its own, from a copy of the workspace's lock and with the vendored `rtp`, `webrtc-ice` and `webrtc-sctp` patched in. Its peers gather on loopback ([below](#how-tests-bind-4500)) |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
 | Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2988`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
@@ -341,6 +342,72 @@ and passes.
 > `CLIPBOARD` with the Windows clipboard. A test run in WSL reaches the clipboard and the display
 > of the person at the Windows machine, as a native run does. Set neither opt-in there.
 
+### How tests bind (#4500)
+
+On Windows, the first UDP bind or TCP listen a program makes on an address other than loopback
+asks the person at the machine whether to allow it. Cargo names a test binary after its crate and
+a hash (`roomlerd-<hash>.exe`), so every new target dir or rebuilt hash is a program Windows has
+not seen, and its prompt reads as if the installed daemon were asking. Until #4500 the `roomlerd`
+lib tests and the vendored webrtc crate's own tests raised it on every fresh build: webrtc-rs
+gathers host candidates on every interface and opens an mDNS socket on the multicast port, and
+production code that tests reach bound `0.0.0.0`. So a test binds loopback, and a webrtc-rs peer
+that a test builds gathers loopback candidates only.
+
+| A test opens | It stays on loopback through | Where |
+|---|---|---|
+| a webrtc-rs peer of its own | `test_net::api()` or `setting_engine()`: an IP filter that keeps loopback, `set_include_loopback_candidate(true)` and mDNS `Disabled` (`confine_to_loopback`) | [`test_net.rs:72`](../agents/roomlerd/src/test_net.rs#L72), [`webrtc_dc.rs:78`](../crates/tunnel-core/src/transport/webrtc_dc.rs#L78) |
+| a peer on a vnet | `test_net::vnet_setting_engine()`: mDNS off and no filter, since a vnet's addresses are virtual | [`test_net.rs:82`](../agents/roomlerd/src/test_net.rs#L82) |
+| production code: the session's peer, a tunnel's peer, the relay probe, the local TURN host | a switch that is the identity outside the lib's own tests (`cfg!(test)`): `rc_engine`, `GATHER`, `any_v4` | [`peer.rs:522`](../agents/roomlerd/src/peer.rs#L522), [`tunnel/peer.rs:99`](../agents/roomlerd/src/tunnel/peer.rs#L99), [`relay_probe.rs:90`](../agents/roomlerd/src/relay_probe.rs#L90), [`rc_local_turn.rs:205`](../agents/roomlerd/src/rc_local_turn.rs#L205) |
+| tunnel-core's `TunnelPeer` | `TunnelPeer::new` reads `cfg!(test)`, which holds only in tunnel-core's own tests; a test in another crate calls `new_with(.., Gather::LoopbackOnly)` | [`webrtc_dc.rs:109`](../crates/tunnel-core/src/transport/webrtc_dc.rs#L109) |
+| a peer in the vendored webrtc crate's own tests | under `cfg(test)`, `create_agent` confines an engine the test left at its defaults (no filter, no vnet) | [`ice_gatherer.rs:343`](../crates/vendored/webrtc/src/ice_transport/ice_gatherer.rs#L343) |
+
+`cfg!(test)` is true only in the build of the crate whose tests run. That is why each switch
+lives in the crate that binds, and why a caller in another crate passes `Gather`. Outside a test
+build every switch returns production's own value, so a daemon on a real host binds as before.
+
+A test whose subject needs a bind off loopback says so in `#[cfg_attr(windows, ignore = "...")]`.
+It runs on Linux CI and in no plain run on Windows:
+
+| Tests | Why they bind off loopback |
+|---|---|
+| `session_carrier`'s `a_pair_on_the_agents_udp_relay_names_its_transport` and `a_relay_learnt_as_prflx_before_its_candidate_reads_as_the_relay`, `carrier_rank`'s `the_opening_reads_the_agents_route_at_once_under_route_only` | webrtc-ice binds its TURN client socket on `0.0.0.0`, whatever the filter |
+| `ice_lifetime_tests`' `a_candidate_gathered_after_close_does_not_outlive_the_agent` and `an_unanswered_mdns_resolution_ends_with_the_agent` | the first gathers a server-reflexive candidate, and webrtc-ice binds that socket on `0.0.0.0`; the second's subject is mDNS, on port 5353 |
+| `tunnel::quic_peer`'s `agent_quic_rendezvous_delivers_authed_flow`, `a_client_that_drops_its_connection_is_reaped` and `agent_quic_rejects_bad_token_so_no_flow`, `tunnel::acceptor`'s `quic_forward_request_accepts_then_pumps_to_dst` | quinn-udp probes GSO at a connection's first send, on a socket it binds to `[::]:0` (on Windows, once a process) |
+| vendored webrtc: `test_new_ice_gatherer_success`, `test_peer_connection_close_is_send` | they gather server-reflexive candidates from a STUN server on the internet, and webrtc-ice binds that socket on `0.0.0.0` |
+| vendored webrtc: `test_ice_gather_mdns_candidate_gathering` | its subject is mDNS, on port 5353 |
+
+**How CI holds it.** `arm` in [`scripts/test-binds-audit.ps1`](../scripts/test-binds-audit.ps1)
+turns on WFP auditing ("Filtering Platform Connection") and binds two UDP canaries of its own, on
+`0.0.0.0` and `127.0.0.1`. After the tests, `report` reads Security events 5158 (bind) and 5154
+(listen) for the test binary's image. Every UDP bind and every TCP listen must be on loopback; a TCP
+bind with no listen is an outgoing connection and raises no prompt. A run whose log has no canary
+measured nothing and fails, and so does a binary that never ran. Each bind off loopback is printed
+with its time, to be read against the test output.
+[`scripts/test-binds-run.sh`](../scripts/test-binds-run.sh) wraps a command in both halves. Two
+lanes run under it:
+
+- `ci.yml`'s `windows-agent-sessions`: the whole `roomlerd --lib` suite
+  ([`ci.yml:2139`](../.github/workflows/ci.yml#L2139)).
+- `test-binds.yml`'s `vendored-webrtc-windows`: the vendored webrtc crate's own tests
+  ([`scripts/vendored-webrtc-test.sh`](../scripts/vendored-webrtc-test.sh)), on a PR or a master
+  push that changes the vendored `webrtc`, `webrtc-ice`, `webrtc-sctp` or `rtp`, the audit scripts
+  or the workflow. Its `report-cases` job runs the report on eight made-up event sets
+  ([`scripts/test-binds-audit-test.ps1`](../scripts/test-binds-audit-test.ps1)). On Linux the
+  same tests run in full, the three ignored on Windows too, as the `webrtc` entry of `ci.yml`'s
+  `vendored-tests` matrix ([below](#the-tests-of-the-vendored-forks-4503)). That matrix holds
+  one entry per fork, so the Windows run is a job of `test-binds.yml`.
+
+`arm` changes the machine's audit policy, so it refuses to run outside GitHub Actions unless it is
+given `-OnThisMachine`.
+
+A new test that needs a socket binds `127.0.0.1:0` or `[::1]:0` and builds its peers through
+`test_net`. Where production code binds the socket, its address goes through a `test_net` switch.
+Where production code binds an address the test hands it, the test hands it loopback: the SSH
+interception probes the overlay address its TUN factory is given with a bind and a listen
+(`warn_if_os_listener`), so `ssh_mint`'s `intercepts_ssh` gives it `127.0.0.1`.
+On Linux, `strace -f -e trace=bind,listen` on a test binary lists every bind with its address; run
+directly, outside cargo, the binary needs `CARGO_MANIFEST_DIR`.
+
 ## CI & special lanes
 
 | Lane | What it does |
@@ -356,10 +423,11 @@ and passes.
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 | **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
-| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 4,100 tests (4,140 on 2026-11-25; 2,400 when the lane began), one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002). ⚠️ A stall is not a slow start, and no deadline fixes one. Twice, on 2026-11-19 and 11-25, the four `exec::session_lifetime` cells whose PowerShell calls `Start-Process` started within 4 s of each other and all four sat silent to their 120 s deadline, against about 1.5 s green, while a cmd cell beside them passed (#4444). Each such cell now takes a turn (`exec::session_lifetime::Turn`, held by the pty and Roomler SSH quiet-shell cells too), its deadline counts from the turn, and a red says where its chain stopped: the stand-in's start, its runtime, the pty, PowerShell's start, `Start-Process`, or the pid file's write, with the stand-in's own output, its folder and what of it still runs. Since #3813 a step of its own follows the suite with `clipboard` added, so the suite builds and runs as before: the clipboard module without the opt-in, with a sentinel on the runner's clipboard that must survive, then the round trip with it ([above](#tests-that-change-a-real-desktop-3813)) |
+| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 4,100 tests (4,140 on 2026-11-25; 2,400 when the lane began), one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002). ⚠️ A stall is not a slow start, and no deadline fixes one. Twice, on 2026-11-19 and 11-25, the four `exec::session_lifetime` cells whose PowerShell calls `Start-Process` started within 4 s of each other and all four sat silent to their 120 s deadline, against about 1.5 s green, while a cmd cell beside them passed (#4444). Each such cell now takes a turn (`exec::session_lifetime::Turn`, held by the pty and Roomler SSH quiet-shell cells too), its deadline counts from the turn, and a red says where its chain stopped: the stand-in's start, its runtime, the pty, PowerShell's start, `Start-Process`, or the pid file's write, with the stand-in's own output, its folder and what of it still runs. Since #3813 a step of its own follows the suite with `clipboard` added, so the suite builds and runs as before: the clipboard module without the opt-in, with a sentinel on the runner's clipboard that must survive, then the round trip with it ([above](#tests-that-change-a-real-desktop-3813)). Since #4500 the suite runs under the bind audit: a UDP bind or TCP listen off loopback by the test binary fails the step, even when every test passed ([above](#how-tests-bind-4500)) |
+| **The tests' binds on Windows** (#4500, `test-binds.yml`) | On a PR or a master push that changes the vendored `webrtc`, `webrtc-ice`, `webrtc-sctp` or `rtp`, the bind audit's scripts or the workflow: the vendored webrtc crate's own tests on a Windows runner under the bind audit, and the audit's report on eight made-up event sets ([above](#how-tests-bind-4500)). On Linux those tests run in the `vendored-tests` matrix (#4503, below). The `roomlerd` lib suite's audit runs in `windows-agent-sessions`, on the build that job already makes |
 | **The desktop companion on Windows** (#3940, `ci.yml` job `windows-overlay-clippy`, step "The desktop companion on Windows — clippy + unit tests (#3940)", [`ci.yml:2018`](../.github/workflows/ci.yml#L2018)) | `cargo clippy -p roomler-desktop --all-targets -- -D warnings`, then `cargo test -p roomler-desktop --bins`, natively on Windows and with no features, as the release builds the companion. Before it no lane compiled the companion's `#[cfg(windows)]` code: its unit tests ran on Linux (step "Test the desktop companion (roomler-desktop)") and macOS only `cargo check`ed it. So a Windows-only error or lint first showed up in the release build: in the login start (the Run key), the service start's spawn with no inherited handles, the panels' capture exclusion or the machine-wide config path. The step sits beside the setup wizard's, in a job whose cache already holds the wizard's Tauri 2 tree; the companion's adds `tray-icon` and `protocol-asset`. The job's cache cap rose to 11,000 MB with it ([build-caches.md](build-caches.md#4-growth-control-the-accretion-gc)) |
 | **The Windows jobs' shell** (#3352, [`scripts/windows-shell-guard.sh`](../scripts/windows-shell-guard.sh)) | Every `ci.yml` job on a Windows runner runs its `run:` steps in bash, which GitHub starts with `-eo pipefail`, so a step stops at its first failing command. Under the runner's default pwsh the LAST native command decided a step: six steps ran `cargo clippy … -D warnings` and then `cargo test`, and a lint was printed while the step passed with the tests. The default is set per job, because a workflow-wide bash would add `pipefail` to every Linux step. A guard in `rust-lint` fails a Windows job that leaves it out, after it has refused a planted workflow. A step that needs PowerShell says `shell: pwsh` and checks `$LASTEXITCODE` after each native command, which is also the rule in the release and installer workflows, whose Windows steps are PowerShell by design |
-| **The vendored forks' own tests** (#4503, `ci.yml` jobs `vendored-tests` and `vendored-lanes-audit`, [`ci.yml:3186`](../.github/workflows/ci.yml#L3186)) | Each crate under `crates/vendored/` that has a `Cargo.toml`, six forks, runs its own tests in an entry of one matrix job, against the workspace's `Cargo.lock`, and each entry is a check of its own, `Vendored <fork> tests`. It runs on every push to master and every PR that is not docs-only. An audit on every PR fails a fork with no entry and an entry that names no fork. Not yet in the `rust` aggregator's needs — [below](#the-tests-of-the-vendored-forks-4503) |
+| **The vendored forks' own tests** (#4503, `ci.yml` jobs `vendored-tests` and `vendored-lanes-audit`, [`ci.yml:3186`](../.github/workflows/ci.yml#L3186)) | Each crate under `crates/vendored/` that has a `Cargo.toml`, six forks, runs its own tests in an entry of one matrix job, against the workspace's `Cargo.lock`, and each entry is a check of its own, `Vendored <fork> tests`. It runs on every push to master and every PR that is not docs-only. An audit on every PR fails a fork with no entry and an entry that names no fork. Not yet in the `rust` aggregator's needs. The `webrtc` fork's tests also run on Windows, under the bind audit, in `test-binds.yml` (#4500) — [below](#the-tests-of-the-vendored-forks-4503) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
@@ -468,22 +536,22 @@ roomler's patches, and the root `Cargo.toml` puts it in place of the crates.io c
 one, and the drift checks in `rust-lint` compare a fork's text with its `.patch` file, not what
 it does. Until #4503 two of the six forks ran their own tests in CI, in the jobs `vendored-sctp`
 (#3755) and `vendored-ice` (FR-148 P4). The matrix job `vendored-tests`
-([`ci.yml:3186-3305`](../.github/workflows/ci.yml#L3186-L3305)) now runs one entry per fork,
+([`ci.yml:3186-3295`](../.github/workflows/ci.yml#L3186-L3295)) now runs one entry per fork,
 each a check named `Vendored <fork> tests`, so the two old checks keep their names.
 
 | Fork | Runner | What the entry runs | Skipped, by exact name | Tests, by hand with the entry's command |
 |---|---|---|---|---|
 | `rtp` ([`:3229`](../.github/workflows/ci.yml#L3229)) | ubuntu-latest | `--lib` | none | 68 passed |
 | `scrap` ([`:3237`](../.github/workflows/ci.yml#L3237)) | ubuntu-latest, after the apt sets of `ci-linux-system-deps` | `--lib`. The fork has no tests: the entry builds its X11 arm, patched too, as a test binary, which links libxcb, so a test added to the fork runs from its first PR. The quartz and DXGI arms compile in the macOS and Windows jobs' agent builds | none | 0 |
-| `webrtc` ([`:3242`](../.github/workflows/ci.yml#L3242)) | ubuntu-latest | `--lib`, with the `webrtc-sctp`, `webrtc-ice` and `rtp` forks given as `--config` patches: the fork calls their patched API, and against crates.io's copies it does not compile | none | 149 passed, 1 ignored upstream (`test_rtp_transceiver_stopping`) |
-| `webrtc-ice` ([`:3251`](../.github/workflows/ci.yml#L3251)) | ubuntu-latest | `--lib`. Since FR-148 P4 the fork holds the carrier rank, and `agent_carrier_rank_test.rs` is its only proof | the four `mdns::mdns_test::*` cells, since FR-148 P4: one of them hung for minutes on a Windows box | 134 passed, and `test_udp_mux` failed on a WSL2 host (below) |
-| `webrtc-sctp` ([`:3265`](../.github/workflows/ci.yml#L3265)) | ubuntu-latest | `--lib` | `fuzz_artifact_test::packet_crash_artifacts` and `fuzz_artifact_test::param_crash_artifacts`: both read `fuzz/artifacts`, which the crates.io package does not ship | 181 passed |
-| `wintun-bindings` ([`:3281`](../.github/workflows/ci.yml#L3281)) | windows-latest | `--lib --all-features`: the features the agent ships (`tun` asks for `panic_on_unsent_packets`, `async`, `enable_inner_logging` and `winreg`) and `verify_binary_signature`, which the fork's one test needs. It checks the publisher's signature on the bundled `wintun/bin/amd64/wintun.dll`, with no driver, no admin and no revocation fetch | none | 1 passed, natively on Windows |
+| `webrtc` ([`:3242`](../.github/workflows/ci.yml#L3242)) | ubuntu-latest | `--lib`, with the `webrtc-sctp`, `webrtc-ice` and `rtp` forks given as `--config` patches: the fork calls their patched API, and against crates.io's copies it does not compile. On Windows, `test-binds.yml` runs the same tests under the bind audit, where three that bind off loopback on purpose are ignored ([above](#how-tests-bind-4500)) | none | 149 passed, 1 ignored upstream (`test_rtp_transceiver_stopping`) |
+| `webrtc-ice` ([`:3251`](../.github/workflows/ci.yml#L3251)) | ubuntu-latest | `--lib`. Since FR-148 P4 the fork holds the carrier rank, and `agent_carrier_rank_test.rs` is its only proof | none | 134 passed with the four mDNS cells skipped, and each of the four passed alone; `test_udp_mux` failed on a WSL2 host (below) |
+| `webrtc-sctp` ([`:3255`](../.github/workflows/ci.yml#L3255)) | ubuntu-latest | `--lib` | `fuzz_artifact_test::packet_crash_artifacts` and `fuzz_artifact_test::param_crash_artifacts`: both read `fuzz/artifacts`, which the crates.io package does not ship | 181 passed |
+| `wintun-bindings` ([`:3271`](../.github/workflows/ci.yml#L3271)) | windows-latest | `--lib --all-features`: the features the agent ships (`tun` asks for `panic_on_unsent_packets`, `async`, `enable_inner_logging` and `winreg`) and `verify_binary_signature`, which the fork's one test needs. It checks the publisher's signature on the bundled `wintun/bin/amd64/wintun.dll`, with no driver, no admin and no revocation fetch | none | 1 passed, natively on Windows |
 
 **Each entry** names its runner, its timeout (15 minutes each), its `args` to cargo and, where
 it needs them, its `patches` and `system-deps`. Its skips sit in `skip`, one exact test name a
 line, with their reason in a comment above them. The step
-([`ci.yml:3292-3305`](../.github/workflows/ci.yml#L3292-L3305)):
+([`ci.yml:3282-3295`](../.github/workflows/ci.yml#L3282-L3295)):
 
 - copies the workspace's `Cargo.lock` into the fork, so the fork's tests run against the
   versions the agent ships with, where a build of its own would resolve the newest. Cargo keeps
@@ -509,7 +577,7 @@ follow-up.
 
 **The audit**, [`scripts/vendored-lanes-audit.sh`](../scripts/vendored-lanes-audit.sh), runs in
 the job `vendored-lanes-audit`
-([`ci.yml:3307-3331`](../.github/workflows/ci.yml#L3307-L3331)), check "Every vendored fork has a
+([`ci.yml:3297-3321`](../.github/workflows/ci.yml#L3297-L3321)), check "Every vendored fork has a
 test lane (#4503)". It lists the directories under `crates/vendored/` that hold a `Cargo.toml`
 and the `crate:` of each entry under the job's `matrix:` `include:`, and fails, naming each, on
 a fork with no entry, an entry that names no fork, an entry with no `crate:`, a fork that two
@@ -547,9 +615,10 @@ Known limits:
   networking mode, alone too. Its three connections are each registered by their first
   packet, and then only one of them carries its 8 KiB datagrams. It passed in the old
   `vendored-ice` job on ubuntu-latest, where the entry runs, so it is not skipped.
-- The four mDNS cells that the `webrtc-ice` entry skips pass on Linux, in 2 s or less each. The
-  fork's patch leaves `src/mdns/` alone, but the two connection cells resolve the other agent's
-  `.local` names, the path #1740 patched.
+- The four upstream mDNS cells of `webrtc-ice` run on ubuntu-latest since #4536, and no entry
+  runs them on Windows: one of them hung for minutes on a Windows box. The fork's patch leaves
+  `src/mdns/` alone, but the two connection cells resolve the other agent's `.local` names, the
+  path #1740 patched, so they exercise it. Each passed alone on Linux, in 2 s or less.
 - No test of `wintun-bindings`' own covers its patch (an adapter's drop leaves the NetworkList
   entries alone), and `scrap` has no tests: their entries prove that each fork builds as a test
   binary, and run what it has.

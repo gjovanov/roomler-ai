@@ -503,7 +503,11 @@ pub async fn relay_tunnel_msg_from_agent(
             relay_to_client(
                 state,
                 session_id,
-                ServerMsg::TunnelTerminate { session_id, reason },
+                ServerMsg::TunnelTerminate {
+                    session_id,
+                    reason,
+                    close_connection: false,
+                },
             )
             .await;
             None

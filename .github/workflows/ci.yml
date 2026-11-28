@@ -2135,8 +2135,8 @@ jobs:
       - name: Agent unit tests on Windows (the whole --lib suite)
         env:
           ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
-        run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
+        # #4500 — under the bind audit: every bind on loopback, or the step fails.
+        run: bash scripts/test-binds-run.sh 'roomlerd-*.exe' cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
 
       # #3813 — the real clipboard on Windows, where a developer's own native
       # `cargo test` once replaced what they had copied. Each test that writes
@@ -3252,16 +3252,6 @@ jobs:
             runner: ubuntu-latest
             timeout: 15
             args: --lib
-            # The four upstream mDNS cells, skipped since FR-148 P4: one of
-            # them hung for minutes on a Windows box (measured 2026-11-17).
-            # The patch leaves src/mdns/ alone, but the two connection cells
-            # resolve the other agent's `.local` names, the path #1740
-            # patched.
-            skip: >-
-              mdns::mdns_test::test_generate_multicast_dnsname
-              mdns::mdns_test::test_multicast_dns_mixed_connection
-              mdns::mdns_test::test_multicast_dns_only_connection
-              mdns::mdns_test::test_multicast_dns_static_host_name
           - crate: webrtc-sctp
             runner: ubuntu-latest
             timeout: 15

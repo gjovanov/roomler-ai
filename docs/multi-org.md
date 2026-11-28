@@ -357,7 +357,7 @@ either case: its signalling loop reconnects on its own ladder, and a retry at th
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:3443-3449`](../crates/remote_control/src/signaling.rs#L3443-L3449)) goes only to a
+  ([`signaling.rs:3447-3453`](../crates/remote_control/src/signaling.rs#L3447-L3453)) goes only to a
   node whose join set `supports_join_refusal`
   ([`signaling.rs:1681`](../crates/remote_control/src/signaling.rs#L1681)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`

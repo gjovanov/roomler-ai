@@ -235,13 +235,13 @@ device never gets an order recorded — the route refuses it 409 up front. The s
 appears when a device was ordered while offline and then connected without the verb
 (or whose build lost its overlay surface); the socket logs *"overlay-key rotation not
 ordered — this device's agent predates rc:agent.key_rotate"* and leaves the order
-standing (`fleet/src/socket.rs:435-439`).
+standing (`fleet/src/socket.rs:462-466`).
 
 ## Reconcile on connect — and the three races it must not re-run
 
 At agent register, where `ConfigPush` reconciles, a standing order is pushed again
-if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:336-352`,
-`:381-389`) — the offline case, through the same path as the online one, so it runs
+if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:363-379`,
+`:408-416`) — the offline case, through the same path as the online one, so it runs
 on every connect rather than only when nobody is watching. Three field cycles on
 2026-08-30 each found a way for that to go wrong; each left a rule:
 
@@ -436,7 +436,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2817`, `:1020`; owner `network` (`:2004`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3295`, `:3329`, `:3354`, `:3385`, `:5756`, `:10978`, `:10993` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
-| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:336-352`, `:417-438` |
+| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:363-379`, `:444-465` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:654-677`; `crates/services/src/dao/agent.rs:1269` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1234-1264` |
@@ -447,7 +447,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | kill switch · epoch | `crates/agent-core/src/config.rs:1096-1101`, `:1894-1899`, `:2024-2026`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2113-2214`; `ui/src/stores/agents.ts:1344-1358` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3408`, `:3426`, `:4158`, `:3396`, `:11013`, `:11295`; the node and network fields `:7275`, `:7522` |
-| P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7434` |
+| P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7498` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:381-423`, `:444-475`, `:813`, `:834`, `:883` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:383`; nest `crates/modules/network/src/lib.rs:556`, `:614` |
 | P2 DERP | `crates/modules/network/src/derp.rs:442`, `:514-550` |

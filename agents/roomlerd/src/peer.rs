@@ -519,7 +519,7 @@ impl AgentPeer {
         let api = APIBuilder::new()
             .with_media_engine(engine)
             .with_interceptor_registry(registry)
-            .with_setting_engine(setting)
+            .with_setting_engine(crate::test_net::rc_engine(setting)) // #4500
             .build();
 
         // rc.162: hostile-NAT hosts (WSL2 + wsl-vpnkit, other userspace-VPN
@@ -16543,7 +16543,7 @@ mod session_end_tests {
     /// closed, and then held at `Closing` for good, which is exactly where a
     /// channel the device closed itself is often left.
     async fn lone_channel(label: &str) -> (Arc<RTCPeerConnection>, Arc<RTCDataChannel>) {
-        let api = APIBuilder::new().build();
+        let api = crate::test_net::api(); // #4500
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration::default())
                 .await
@@ -17485,8 +17485,8 @@ mod files_channel_tests {
         ) -> Self {
             let pc = || async {
                 Arc::new(
-                    APIBuilder::new()
-                        .build()
+                    // #4500 — loopback only.
+                    crate::test_net::api()
                         .new_peer_connection(RTCConfiguration::default())
                         .await
                         .expect("a peer connection"),

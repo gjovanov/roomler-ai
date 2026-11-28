@@ -25,6 +25,7 @@
 //! 4. fleet, only if ours: the Offline write, the presence compare-DEL, the
 //!    `device:presence` OFFLINE transition.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -64,6 +65,28 @@ pub struct AgentCtx {
     /// FR-138 — the window this connection was announced and what its hello
     /// claims back. Empty for every connection announced none.
     pub resume: AgentResume,
+    /// Set when the server ends this connection's agent itself (fleet's
+    /// `Hub::kick_removed_agent`). Every clone shares it: an arm reads it when
+    /// it acts, and [`AgentSocketLifecycle::closing`] reads how the socket
+    /// ended.
+    pub server_ended: ServerEnded,
+}
+
+/// Whether the server ended a connection itself: one flag per connection,
+/// shared by every clone, set once and never cleared.
+#[derive(Clone, Debug, Default)]
+pub struct ServerEnded(Arc<AtomicBool>);
+
+impl ServerEnded {
+    /// The server ends this connection itself.
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::set`] ran for this connection.
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// FR-138 — what an agent's hello claims back, as the Hub registered it
@@ -117,7 +140,8 @@ pub trait AgentSocketLifecycle: Send + Sync {
 
     /// The socket is closing, BEFORE the Hub unregistration: release what
     /// must go regardless of who owns the slot (tunnel sessions live on this
-    /// connection's peers and die with it).
+    /// connection's peers and die with it). `ctx.server_ended` says whether
+    /// the server ended the connection itself.
     async fn closing(&self, ctx: &AgentCtx) {
         let _ = ctx;
     }
@@ -219,7 +243,21 @@ mod tests {
             conn_established_ms: 0,
             tx,
             resume: AgentResume::default(),
+            server_ended: ServerEnded::default(),
         }
+    }
+
+    #[test]
+    fn server_ended_is_one_flag_every_clone_of_the_connection_reads() {
+        let a = ctx();
+        let b = a.clone();
+        assert!(!a.server_ended.get(), "a connection starts unset");
+        b.server_ended.set();
+        assert!(a.server_ended.get(), "a clone sets the connection's flag");
+        assert!(
+            !ctx().server_ended.get(),
+            "another connection keeps its own flag"
+        );
     }
 
     #[tokio::test]

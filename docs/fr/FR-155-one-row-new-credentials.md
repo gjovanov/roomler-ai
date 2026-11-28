@@ -1,7 +1,7 @@
 # FR-155: A one-row conversion gives each enrollment it moves new credentials
 
 **Issue:** [#4467](https://github.com/gjovanov/roomler-ai/issues/4467) · **Status:** claimed 2026-11-25; P1a merged
-(#4470), P1b in review (#4517). D1–D3, D5 and D6 were decided on 2026-11-25, with two requirements added (Q1, Q2); D4 is open, for P4.
+(#4470), P1b merged (#4517), P1c in review (#4530). D1–D3, D5 and D6 were decided on 2026-11-25, with two requirements added (Q1, Q2); D4 is open, for P4.
 **Builds on:** [FR-43](FR-43-macos-single-enrollment.md) P3c (`sudo roomlerd one-row`),
 [FR-147](FR-147-root-out-of-homes-macos.md) (root's records, the person's child),
 [FR-103](FR-103-device-credentials-renew-themselves.md) (the token generation),
@@ -91,7 +91,7 @@ Beside `self_renew` (`crates/modules/fleet/src/agent.rs:841`, route `crates/modu
 - **A device rotates at most once an hour.** A first call while the row's last rotation is less than an hour old is
   answered 429, and the row stays as it is. The ceiling is the filter's last condition, so it needs no state of its
   own. A replay is exempt.
-- **After a first commit, and only then:** the connections of earlier generations end (P1b), the hook runs (P1c),
+- **After a first commit, and only then:** the connections of earlier generations end (P1b, P1c), the hook runs (P1d),
   and the server mints at G+1 as renewal mints (`renew_agent_token`, `crates/services/src/auth/mod.rs:543-574`) and
   answers 200 in the renewal's shape, `{agent_token, expires_at}` (`agent.rs:820-826`).
 - **A replay** mints at the row's generation and changes nothing else.
@@ -105,7 +105,7 @@ Beside `self_renew` (`crates/modules/fleet/src/agent.rs:841`, route `crates/modu
   `token_rotation_audit`. Its index set goes in fleet's plan (`crates/modules/fleet/src/lib.rs:678`), beside
   `config_audit` (`:858-867`), with the same 90-day TTL.
 - **The switch** `rc.agent_token_rotation` (`ROOMLER__RC__AGENT_TOKEN_ROTATION`) sits beside
-  `token_generation_check` (`crates/config/src/settings.rs:1062-1068`). It is off by default until P1c, which turns
+  `token_generation_check` (`crates/config/src/settings.rs:1062-1068`). It is off by default until P1d, which turns
   it on (D5).
 - **The composition baseline** gains the route beside `/api/agent/self/renew`
   (`crates/tests/fixtures/composition.baseline.json:236`) and the index set, re-recorded with `COMPOSITION_UPDATE=1`
@@ -122,7 +122,7 @@ token_gen`), and with the removal's text otherwise. The function gains that one 
 rotation", since a tunnel client does not rotate. The server's log lines carry the reason, so a field read does not
 look for a removal that never happened.
 
-### What the commit ends (P1b, P1c)
+### What the commit ends (P1b, P1c, P1d)
 
 Each live connection records the generation it was admitted under:
 
@@ -143,7 +143,9 @@ The commit then ends the agent's connections admitted below G+1:
   the sweep. So each pod keeps, per agent and for a bounded time, the generation the sweep named, and the Hub
   refuses a registration below it. The sweep stores the floor before it scans the entries, and a registration
   stores its entry before it reads the floor, so one of the two always sees the other.
-- **DERP (P1c, network, through the hook):** the agent's registrations admitted below G+1 end, on this pod by their
+- **Only the device's current generation holds its Hub entry (P1c).** Three parts, described below: the
+  registration reads the row, the entry of a higher generation stays, and every pod checks its own entries.
+- **DERP (P1d, network, through the hook):** the agent's registrations admitted below G+1 end, on this pod by their
   cancel (`derp.rs:564-565`, as `local_rehome_close` does, `crates/modules/network/src/derp_cluster.rs:213-229`)
   and on every other pod by an envelope that carries the generation, with the same floor at registration.
 
@@ -151,7 +153,36 @@ The commit takes the agent's entry out of this pod's Hub before the hook runs. F
 as offline (`overlay_key.rs:165`) and is queued for the next connection (`:217-221`): it is never pushed to a
 connection that is ending.
 
-### The hook `agent_credentials_rotated` (P1c)
+### Only the device's current generation holds its Hub entry (P1c)
+
+P1c makes two properties hold whatever the timing, while the switch is on:
+
+- **A. A registration admits only the device's current generation.**
+- **B. Every pod ends a registered entry below its row's current `token_gen` within N**, also a pod that the
+  commit's control event does not reach. N is one period of `rc.presence_sweep_secs` (30 s by default, never
+  under 5 s) plus the time of one read.
+
+| Part | Where | What it does |
+|---|---|---|
+| **The registration's read** (A) | the agent socket, after the hello and before anything is written (`registration_generation` in `crates/modules/fleet/src/socket.rs`) | reads the row on the primary (`AgentDao::find_any_in_tenant_on_the_primary`) and judges the connection's generation with FR-103's rule, in the upgrade's order: `refusal_reason` first, then `generation_refusal`. A row of another generation is refused with the upgrade's line, `refusing agent WS: token of another generation`, and `at=registration`; a row gone is refused as the upgrade refuses it; a removed or quarantined row is the removal's to answer; a failed read admits, as the upgrade's pre-read does |
+| **The entry of a higher generation stays** (A) | `Hub::admit_agent` (`crates/modules/fleet/src/hub/rotation.rs`), in the entry's lock | a registration below the generation of the entry it would replace is refused as one below the floor is (`BelowFloor`), and the entry and its socket stay as they were |
+| **Every pod checks its own entries** (B) | `crates/modules/fleet/src/generation_check.rs`, a loop on every pod, as the resume scope's reconciler runs (`resume_scope::spawn_reconciler`) | each period it collects the pod's entries (`Hub::agent_generations`), reads the live rows' `token_gen` on the primary in one query with a projection (`AgentDao::live_generations_on_the_primary`), and ends each entry below its row's generation through `Hub::end_below_generation`, so the disconnect line (`by=rotated`), the floor and the sessions are as at P1b's sweep. It reads Mongo only. It is not the presence sweep, which runs on one pod a cycle, through a Redis claim |
+
+**Why the read and the floor together admit no registration below a commit.** Take a connection that the upgrade
+admitted at G, and a commit to G+1. A commit before the registration's read is seen by the read, which refuses.
+After the read, the pod's sweep runs after the commit too: on the pod that commits before the route answers, on
+another when the control event arrives. A sweep before the admit has stored the floor, which the admit reads under
+the entry's lock and refuses; a sweep after the admit finds the entry and ends it. The floor stands at the admit,
+since `ROTATION_FLOOR_SECS` (600 s) covers the time from the read to the admit: the hello's write and at most one
+read of the resume scope. Every pod's check then makes B hold whatever the order of events.
+
+A refused registration registers nothing and writes nothing, so it writes no Offline (P1b's decision). The three
+parts run only while `rc.agent_token_rotation` and `rc.token_generation_check` are both on, since a rotation
+commits only then (`Hub::set_token_rotation`, set once at startup). With either off, nothing of P1c runs: no read at
+the registration, no check, and a registration replaces the entry as it always has
+(`replaced_by_newer_connection`). T18 shows it.
+
+### The hook `agent_credentials_rotated` (P1d)
 
 A new `FleetLifecycle` hook in `crates/core/src/hooks.rs`, beside `agent_removed` (`:98`), with a default no-op:
 fleet cannot call network, and a hook is the inverse edge. It carries the tenant, the agent and the new generation.
@@ -346,7 +377,7 @@ A Mac whose root records are all gone does not read as converted (`converted_roo
 
 | Phase | Switch | Off means |
 |---|---|---|
-| P1 | `rc.agent_token_rotation` (`ROOMLER__RC__AGENT_TOKEN_ROTATION`); the route also answers 404 while `rc.token_generation_check` is off | 404 for a first call: devices keep their credentials, keep working and show `rekey_pending`; a replay is answered. The fleet-wide switch (D5) |
+| P1 | `rc.agent_token_rotation` (`ROOMLER__RC__AGENT_TOKEN_ROTATION`); the route also answers 404 while `rc.token_generation_check` is off | 404 for a first call: devices keep their credentials, keep working and show `rekey_pending`; a replay is answered. Nothing of P1c runs: no read at the registration, no check. The fleet-wide switch (D5) |
 | P2 | `ROOMLERD_ONE_ROW_SPLICE=0` | a revert refuses a person whose credentials differ, and never puts the kept ones back (fails closed) |
 | P3 | `ROOMLERD_CREDENTIAL_ROTATION=0` | no first request; the entries stay recorded and visible, and a `requested` one is asked again with its key |
 | P4 | `ROOMLERD_ONE_ROW_REKEY_EXISTING=0` | nothing recorded at start |
@@ -354,34 +385,42 @@ A Mac whose root records are all gone does not read as converted (`converted_roo
 ### Tests
 
 Each cell fails on master before its PR and passes on it, except M6 and M16, which pass on master too: they pin
-what the design rests on. T1's P1b half and T14 pass on master too. FR-103's check already answers 401 to a token
-of G once the row is at G+1 (run [46001191285](https://github.com/gjovanov/roomler-ai/actions/runs/46001191285),
-at P1b's cells), and T14 pins that with the switch off nothing changes. The names state the property.
+what the design rests on. T1's P1b half, T14 and T18 pass on master too. FR-103's check already answers 401 to a
+token of G once the row is at G+1 (run [46001191285](https://github.com/gjovanov/roomler-ai/actions/runs/46001191285),
+at P1b's cells), and T14 and T18 pin that with the switch off nothing changes. T15, T16 and T17 fail on P1b's code,
+before P1c's change (runs [46069840160](https://github.com/gjovanov/roomler-ai/actions/runs/46069840160) and
+[46069840296](https://github.com/gjovanov/roomler-ai/actions/runs/46069840296), at P1c's cells). The names state the
+property.
 
 **Server (P1).** The integration cells run in `.github/workflows/integration-tests.yml`, job `integration`, step
 "Run the suite" (`:288`). A PR fires that lane only through its path filter (`:44-59`), which lists
 `crates/tests/**` and neither `crates/modules/**` nor `crates/core/**`, so each P1 PR carries its cells in
-`crates/tests`. Each cell starts its server with the switch on.
+`crates/tests`. Each cell starts its servers with the switch on, except a server that shows the switch off (T6,
+T14, T18).
 
 | # | Cell | Phase | Asserts |
 |---|---|---|---|
 | T1 | `a_rotation_issues_the_next_generation` | P1a, P1b | rotate: the new token's `gen` claim and the row are at G+1, and an HTTP route answers 401 to a token of G (P1a). The agent socket's upgrade and a DERP dial admit the new token and answer 401 to one of G, and a renewal with the token of G after the commit is refused (P1b; FR-103's assertions, `crates/tests/src/token_renewal_tests.rs:239-250`) |
 | T2 | `a_lost_answer_is_recovered_with_the_rotation_key` | P1a | rotate, then ask again with the same token and key: 200 at G+1, and nothing else changes. With another key: 401 |
 | T3 | `one_rotation_per_generation` | P1a | one rotation per generation: the conditional update commits once at G, and the row ends at G+1 |
-| T4 | `a_rotation_ends_the_connections_of_earlier_generations` | P1b, P1c | an agent socket and a DERP registration open at G, then rotate: both end within 5 s. With two servers, a socket on B ends when A rotates. A socket opened at G+1 survives a late envelope |
-| T5 | `a_rotation_takes_the_node_offline_and_orders_a_key` | P1c | a joined node, then rotate: the node is Offline, a peer's netmap marks it unreachable, and the row carries a `credential_rotation` order, queued and delivered at the next connect at G+1 |
+| T4 | `a_rotation_ends_the_connections_of_earlier_generations` | P1b, P1d | an agent socket and a DERP registration open at G, then rotate: both end within 5 s. With two servers, a socket on B ends when A rotates. A socket opened at G+1 survives a late envelope |
+| T5 | `a_rotation_takes_the_node_offline_and_orders_a_key` | P1d | a joined node, then rotate: the node is Offline, a peer's netmap marks it unreachable, and the row carries a `credential_rotation` order, queued and delivered at the next connect at G+1 |
 | T6 | `rotation_is_unsupported_while_switched_off` | P1a | `rc.agent_token_rotation=false`: a first call is answered 404 and the audit row says `unsupported`, while a replay of a rotation made before is answered 200; `rc.token_generation_check=false`: 404 |
 | T7 | `a_removed_or_quarantined_row_does_not_rotate` | P1a | a tombstoned row: 401; a quarantined row: 401; the generation unchanged |
 | T8 | `the_composition_includes_the_rotate_route` | P1a | the composition gate (`crates/tests/fixtures/composition.baseline.json`) |
 | T13 | `a_second_rotation_within_the_hour_waits` | P1a | rotate, then a first call with the new token within the hour: 429, the audit row says `rate_limited`, and the generation is unchanged; a replay of the first rotation is answered 200; with the row's `token_rotation.at` set back by more than an hour, the second rotation commits |
 | T14 | `a_rotation_switched_off_ends_no_connection` | P1b | `rc.agent_token_rotation=false`: a first call's 404 ends nothing, on the pod it reached or on another, and keeps no floor (a second socket of the same generation registers) |
+| T15 | `a_registration_admits_only_the_current_generation` | P1c | two sockets upgraded at G, then a rotation to G+1 on a pod without Redis, and a floor of 1 s on the sockets' pod (`Hub::end_below_generation_for`) that ends before their hellos. A socket of G+1 registers. The first G socket's hello is then refused: it closes with no goodbye, and the socket of G+1 stays served and hears nothing. With the G+1 socket closed, the second G socket's hello is refused too, and no entry is left |
+| T17 | `every_pod_ends_an_entry_below_its_rows_generation` | P1c | a socket registered at G on a pod whose check runs every 5 s, then a rotation to G+1 on a pod without Redis, so the control event reaches no other pod: the socket closes with no goodbye within 10 s. A socket of G+1 then stays served through two periods |
+| T18 | `a_pod_switched_off_ends_and_refuses_nothing_new` | P1c | T14's extension: on a pod with `rc.agent_token_rotation=false`, beside a rotation committed on a pod with it on, nothing of P1c runs. In T15's and T17's setups the pod refuses nothing new and ends nothing new through two periods, and a registration replaces the entry as it always has (`replaced_by_newer_connection`) |
 
 | # | Cell | Phase | Asserts | Lane, step |
 |---|---|---|---|---|
 | T9 | `rotation_admission` | P1a | the admission's truth table: the claim's generation against the row's, the last rotation's generation and key hash, and `exp` | `ci.yml` job `rust-unit`, "Run fleet module unit tests" (`:542-543`) |
-| T10 | `credential_rotation_hook_runs_leave_then_order` | P1c | the hook's effects in order, against a stand-in state | `rust-unit`, "Run the remaining crates' unit tests" (`:568-577`, `-p roomler-ai-mod-network`) |
+| T10 | `credential_rotation_hook_runs_leave_then_order` | P1d | the hook's effects in order, against a stand-in state | `rust-unit`, "Run the remaining crates' unit tests" (`:568-577`, `-p roomler-ai-mod-network`) |
 | T11 | `a_rotated_generation_is_refused_with_its_own_reason` | P1a | `generation_refusal`: below a generation a rotation made, the rotation's text; below one a removal made, the removal's; equal, none; the switch off, none | "Run fleet module unit tests" |
 | T12 | `the_hub_admits_no_connection_below_a_rotated_generation` | P1b | a registration below the pod's floor is refused, and the sweep ends the entries below the floor and keeps one at it, in either order of sweep and registration | "Run fleet module unit tests" |
+| T16 | `the_hub_keeps_the_entry_of_the_higher_generation` | P1c | with the rotation on, a registration below the entry it would replace is refused (`BelowFloor`) and the entry stays, its cancel unfired; a higher generation replaces a lower one; a registration of each of two generations at once leaves the higher one's entry, 500 times; with the rotation off, a registration is admitted as before P1c | "Run fleet module unit tests" |
 
 **Device (P2 to P4).** These cells use the conversion's `Host` trait and its fake (`one_row.rs:1695-1756`, the fake
 at `:4465`) and record the order of the effects. They compile on every platform, and they hand in keys rather than
@@ -440,19 +479,23 @@ ledger's key digests.
 | F7 | a conversion where one of the person's orgs is already root's (the "retired" fate), beside a moved one | root's own row in that org keeps its generation; the moved row's is +1 |
 | F8 | F5, with a remote-control session and an SSH connection on a moved row opened within the clean-run threshold and held past it | `Status` reads `rekey_pending` while either is live, neither is cut, and the re-key completes after both end |
 
-P1 changes nothing on a device: no release calls the route before P3. Its cells are T1 to T13, and its effects are
+P1 changes nothing on a device: no release calls the route before P3. Its cells are T1 to T18, and its effects are
 read in the field with P3's cells.
 
 ## Phases
 
-Ship order: P1a, P1b, P1c, then P2, P3, P3b, P4 and P5. P2 lands before P3 because a revert must splice before any
-rotation exists; without P3 the splice changes nothing, so P2 is safe alone.
+Ship order: P1a, P1b, P1c, P1d, then P2, P3, P3b, P4 and P5. P2 lands before P3 because a revert must splice before
+any rotation exists; without P3 the splice changes nothing, so P2 is safe alone.
+
+P1c was added on 2026-11-27, between P1b and the hook's phase, which is now P1d. D5, the issue's body and P1a's PR
+call the hook's phase P1c.
 
 | Phase | What | Kill switch, or back-out | Status |
 |---|---|---|---|
 | P1a | Server: the route, its admission and replay, the conditional update with its once-an-hour ceiling (429, T13), `token_rotation` on the row, the audit with the caller's IP and its index set, the refusal reason for a generation a rotation retired (Q2), the composition baseline; the route in `docs/api.md` | `rc.agent_token_rotation`, off by default | MERGED (#4470) |
-| P1b | Server: each control socket records its generation; the commit ends the agent's sockets below the new generation on every pod (`end_below_generation`), and each pod keeps a floor at registration; T1's second half (the agent socket's upgrade and a DERP dial admit G+1 and refuse G, and a renewal with the token of G after the commit is refused) | the same switch, off by default | in progress (#4517) |
-| P1c | Server: the core hook `agent_credentials_rotated`; the network module takes the node offline, ends its DERP registrations below the new generation (with the floor) and queues an FR-40 order (`credential_rotation`); **the switch on by default** (D5) | `rc.agent_token_rotation`: 404, fleet-wide | — |
+| P1b | Server: each control socket records its generation; the commit ends the agent's sockets below the new generation on every pod (`end_below_generation`), and each pod keeps a floor at registration; T1's second half (the agent socket's upgrade and a DERP dial admit G+1 and refuse G, and a renewal with the token of G after the commit is refused) | the same switch, off by default | MERGED (#4517) |
+| P1c | Server: only the device's current generation holds its Hub entry, on every pod. The registration reads the row after the hello and judges the generation by FR-103's rule; the entry of a higher generation stays; every pod's check ends an entry below its row's generation within N, one period of `rc.presence_sweep_secs`; T15 to T18 | the same switch, off by default: with it off, nothing of P1c runs | in progress (#4530) |
+| P1d | Server: the core hook `agent_credentials_rotated`; the network module takes the node offline, ends its DERP registrations below the new generation (with the floor) and queues an FR-40 order (`credential_rotation`); **the switch on by default** (D5) | `rc.agent_token_rotation`: 404, fleet-wide | — |
 | P2 | Device: `splice_current` in the undo and `--revert`; the child verb `refresh-legacy` | `ROOMLERD_ONE_ROW_SPLICE=0`, which fails closed | — |
 | P3 | Device: `rekey.json`, the one-row lock, the re-key in each moved enrollment's loop (Q1), `Status`'s `credentials`, the conversion's bounded wait and its report; the release notes' line on `--revert` | `ROOMLERD_CREDENTIAL_ROTATION=0` | — |
 | P3b | Device: every root-daemon config write takes the one-row lock (D2) | its own PR names it | — |
@@ -464,7 +507,7 @@ rotation exists; without P3 the splice changes nothing, so P2 is safe alone.
 - [ ] **AC1** (P3, F1): after a conversion, each moved row is online at the next token generation, and root's file
   holds for it a token, a key epoch and a WireGuard secret that differ from root's kept record of the person's
   file, compared as digests on the host.
-- [ ] **AC2** (P1c, P3, F1, F2): each moved row keeps its overlay node id and address, and its `credential_rotation`
+- [ ] **AC2** (P1d, P3, F1, F2): each moved row keeps its overlay node id and address, and its `credential_rotation`
   order reads reported. After the first join with the overlay on, the network's ledger holds the key root's kept
   record names, with the reason `rotate`.
 - [ ] **AC3** (P3, F3): with the server unreachable after a conversion, the row stays online and reaches the next
@@ -484,13 +527,21 @@ rotation exists; without P3 the splice changes nothing, so P2 is safe alone.
   caller's IP.
 - [ ] **AC9** (Q2, P1a, T11): a token of a generation a rotation retired is refused with its own reason, distinct
   from a removal's.
-- [ ] **AC10**: each phase's switch is proven both ways: P1's by T6, P2's by M5, P3's by F6, P4's by M21.
-- [ ] **AC11**: the test cells above, M6 and M16 aside, fail on master before their PR, and every cell passes in
-  the lane named.
+- [ ] **AC10**: each phase's switch is proven both ways: P1's by T6 (P1c's parts by T15 to T17 on, and T18 off),
+  P2's by M5, P3's by F6, P4's by M21.
+- [ ] **AC11**: the test cells above, M6, M16, T14, T18 and T1's P1b half aside, fail on master before their PR, and
+  every cell passes in the lane named.
 - [ ] **AC12** — Docs updated in house style (tables, the commit's sequence as a mermaid diagram, `file:line`
   anchors): `docs/device-credentials.md`'s rotation section, `docs/installation.md`'s one-row Mac (what a
   conversion does to credentials, and `--revert`), `docs/api.md`'s route, this spec's field log, and a row in
   `docs/README.md`'s index.
+- [ ] **AC13** (P1c, A, T15, T16, T18): while the switch is on, a registration admits only the device's current
+  generation, whatever the timing: a socket of an earlier generation is refused at its hello and writes nothing,
+  no Offline included, and when a registration below the entry it would replace is refused, the entry stays and
+  hears nothing. With the switch off, a registration is admitted as before.
+- [ ] **AC14** (P1c, B, T17, T18): while the switch is on, every pod ends a registered entry below its row's current
+  `token_gen` within N, one period of `rc.presence_sweep_secs` (30 s by default) plus one read, also a pod that the
+  commit's control event does not reach. With the switch off, no check runs.
 
 ## Decisions
 
