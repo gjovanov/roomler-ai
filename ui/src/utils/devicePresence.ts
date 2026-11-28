@@ -73,8 +73,15 @@ export function presenceTitle(
   r: PresenceRow,
   fmt: (iso: string) => string = defaultFmt,
 ): string {
+  // #4553 — the server derives a tunnel client's presence from its socket.
+  // `stale` comes only when the server could not ask its presence directory.
   if (r.kind === 'tunnel_client')
-    return r.is_online ? 'Online (stored status)' : 'Offline (stored status)'
+    return r.presence === 'online'
+      ? 'Online — its tunnel socket is connected'
+      : r.presence === 'stale'
+        ? 'Stale — the server could not confirm its tunnel socket just now, and the client ' +
+          'was seen in the last few minutes. It reads online or offline again once it can.'
+        : 'Offline'
   if (isAsleep(r)) return sleepTitle(r.sleep!, r.os, fmt)
   return r.presence === 'online'
     ? 'Online — a control socket is registered'

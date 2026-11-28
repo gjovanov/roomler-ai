@@ -201,7 +201,7 @@ sequenceDiagram
 ### 3.1 The posture
 
 `PowerBrief { policy, on_ac?, held }`
-([`models.rs:2135`](../crates/remote_control/src/models.rs#L2135)) rides the
+([`models.rs:2291`](../crates/remote_control/src/models.rs#L2291)) rides the
 heartbeat as an optional `power`
 ([`signaling.rs:686`](../crates/remote_control/src/signaling.rs#L686)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
@@ -216,7 +216,7 @@ not answered yet holds nothing (§1.1).
   stay two answers.
 - `held: false` is what **asleep by policy** means: nothing was holding the
   machine, so the OS slept it as the policy allows
-  ([`models.rs:2156`](../crates/remote_control/src/models.rs#L2156)
+  ([`models.rs:2312`](../crates/remote_control/src/models.rs#L2312)
   `by_policy`). `held: true` means it slept past the hold: a closed lid, a
   person, or the OS overruling it.
 
@@ -263,7 +263,7 @@ sleep would say hello again and erase the reason.
 - The next hello `$unset`s `sleep`
   ([`agent.rs:668`](../crates/services/src/dao/agent.rs#L668)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
-  online ([`models.rs:2185`](../crates/remote_control/src/models.rs#L2185)). A
+  online ([`models.rs:2341`](../crates/remote_control/src/models.rs#L2341)). A
   read between the reconnect and that write never shows a stale "asleep".
 
 ### 3.4 What each surface shows
@@ -272,10 +272,10 @@ sleep would say hello again and erase the reason.
 |---|---|---|
 | `roomler status` | `power` ([`lib.rs:221`](../crates/localapi/src/lib.rs#L221)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2490`](../agents/roomler-cli/src/localclient.rs#L2490)) |
 | `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3517`](../agents/roomler-cli/src/localclient.rs#L3517)) |
-| the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
+| the dashboard's devices grid | `sleep { since, power }` ([`device.rs:123`](../crates/api/src/routes/device.rs#L123)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:97`](../ui/src/utils/devicePresence.ts#L97) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
-| the admin agent API | `power`, `sleep` ([`agent.rs:1409`](../crates/modules/fleet/src/agent.rs#L1409)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3735`](../crates/remote_control/src/models.rs#L3735)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| the admin agent API | `power`, `sleep` ([`agent.rs:1412`](../crates/modules/fleet/src/agent.rs#L1412)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3891`](../crates/remote_control/src/models.rs#L3891)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 

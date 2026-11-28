@@ -4539,6 +4539,12 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // FR-101 P2b — `None` HERE for the same reason: the owner's floor is
         // live config, and `stub_caps` fills it at every announcement.
         session_policy: None,
+        // FR-67 P5 / #3332 — `None` HERE as well: the last install's verdict
+        // and the crash ladder are the host's live state, read by the daemon's
+        // own refresher (`health_words`), never by the probe child.
+        // `stub_caps` fills both at every announcement.
+        last_install: None,
+        crash_health: None,
         // FR-97 P0c — empty HERE: the honest "no" is the daemon's
         // (`with_honest_words`), like the config lists above.
         unavailable: Default::default(),

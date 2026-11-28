@@ -197,6 +197,32 @@ pub fn read_any_attention() -> Option<AttentionInfo> {
         .find_map(|p| read_attention_at(p))
 }
 
+/// #3332 / #3373 — every sentinel present among `paths`, in their order.
+/// [`read_any_attention`] stops at the first, which hides a machine-wide
+/// `rollback_failed` behind a per-user sentinel of another reason; a reader
+/// that has to know whether the running build is accused reads them all.
+/// Quiet: nothing is logged, nothing is written.
+pub fn read_attention_from(paths: &[PathBuf]) -> Vec<AttentionInfo> {
+    paths.iter().filter_map(|p| read_attention_at(p)).collect()
+}
+
+/// #3332 / #3373 — [`read_attention_from`] over every place a sentinel of
+/// this host may be: per-user, then machine-wide (the two the daemon writes,
+/// `roomlerd`'s `attention_path_for_worker`). The caps' crash word reads it
+/// off the signalling loop, and the daemon's status answer can read the same.
+pub fn read_all_attention() -> Vec<AttentionInfo> {
+    read_attention_from(&all_attention_paths())
+}
+
+/// #3332 / #3373 — whether `info` is a `rollback_failed` sentinel that accuses
+/// the build `running`, by FR-53's own rule ([`rollback_is_stale`]): a
+/// sentinel that names another build, or one from before FR-53 that names
+/// none, accuses nothing. The healthy connect keeps exactly the sentinels this
+/// reads as accusing, so the two cannot disagree.
+pub fn rollback_accuses(info: &AttentionInfo, running: &str) -> bool {
+    info.reason.as_deref() == Some(REASON_ROLLBACK) && !rollback_is_stale(info, running)
+}
+
 /// Remove the per-user attention sentinel if present. Best-effort — a
 /// missing file or a permission glitch is silent.
 pub fn clear_attention() {
@@ -613,5 +639,45 @@ mod tests {
         );
         assert_eq!(read.reason.as_deref(), Some(REASON_ROLLBACK));
         assert_eq!(read.failed_version.as_deref(), Some("0.4.231"));
+    }
+
+    /// #3332 / #3373 — the shared reader takes every sentinel there is, in the
+    /// order of its paths, where `read_any_attention` stops at the first: a
+    /// per-user `server_goodbye` must not hide the machine's `rollback_failed`.
+    /// Driven against tempdirs, never the real walk (see
+    /// `should_clear_on_healthy_connect`).
+    #[test]
+    fn every_sentinel_is_read_and_only_a_live_rollback_accuses() {
+        let user = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let goodbye =
+            raise_attention_at_full(user.path(), REASON_GOODBYE, "the server said goodbye", None)
+                .unwrap();
+        let rollback = raise_attention_at_full(
+            machine.path(),
+            REASON_ROLLBACK,
+            "0.4.240 has crashed 3 times",
+            Some("0.4.240"),
+        )
+        .unwrap();
+        let missing = user.path().join("nothing-here").join(ATTENTION_FILENAME);
+        let held = read_attention_from(&[missing, goodbye.clone(), rollback.clone()]);
+        assert_eq!(
+            held.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
+            vec![goodbye, rollback]
+        );
+        assert!(!rollback_accuses(&held[0], "0.4.240"), "another reason");
+        assert!(
+            rollback_accuses(&held[1], "0.4.240"),
+            "the accused build runs"
+        );
+        assert!(rollback_accuses(&held[1], " 0.4.240 "));
+        assert!(!rollback_accuses(&held[1], "0.4.239"), "another build runs");
+        let legacy = info(Some(REASON_ROLLBACK), None);
+        assert!(
+            !rollback_accuses(&legacy, "0.4.240"),
+            "before FR-53: names none"
+        );
+        assert!(read_attention_from(&[]).is_empty());
     }
 }

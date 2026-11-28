@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { api } from '@/api/client'
 import { useCapabilitiesStore } from '@/stores/capabilities'
+import type { DevicePresence } from '@/utils/devicePresence'
 
 // Snake-case to match the Rust wire shape — see
 // `crates/api/src/routes/tunnel.rs::TunnelClientResponse`.
@@ -22,8 +23,15 @@ export interface TunnelClient {
   machine_id: string
   os: TunnelClientOs
   client_version: string
+  /** The admin's state (quarantined, …). Not presence: nothing the socket
+   *  does writes it. */
   status: TunnelClientStatus
   last_seen_at: string
+  /** #4553 — derived by the server from the client's live socket, on any of
+   *  its pods. Absent from a server older than that. */
+  presence?: DevicePresence
+  /** `presence === 'online'`. */
+  is_online?: boolean
 }
 
 export interface TunnelEnrollmentToken {
@@ -62,6 +70,10 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
   let seq = 0
   // The latest fetch failed: `ensureTunnelClients` asks again.
   let failed = false
+  /** #4553 — the clients connected now, by the presence the server derives
+   *  from their sockets. Never by `status`: no socket writes it, so a count
+   *  of it read 0 with every client connected. */
+  const onlineCount = computed(() => clients.value.filter((c) => c.is_online === true).length)
 
   async function fetchTunnelClients(tenantId: string) {
     const mySeq = ++seq
@@ -177,6 +189,7 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
   return {
     clients,
     total,
+    onlineCount,
     loading,
     error,
     clientsTenantId,

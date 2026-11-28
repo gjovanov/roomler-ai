@@ -293,6 +293,36 @@
             >
               {{ stallChip(agentFor(item)!)!.text }}
             </FactChip>
+            <!-- FR-67 P5 — only when the last install needs a look: at work,
+                 never reported, or a verdict short of verified. -->
+            <FactChip
+              v-if="item.kind === 'agent' && agentFor(item) && installChipFor(agentFor(item)!)"
+              size="x-small"
+              variant="tonal"
+              class="mt-1"
+              prepend-icon="mdi-package-down"
+              :color="installChipFor(agentFor(item)!)!.color"
+              :explain="installChipFor(agentFor(item)!)!.tooltip"
+              data-testid="agent-install-chip"
+            >
+              {{ installChipFor(agentFor(item)!)!.text }}
+            </FactChip>
+            <!-- #3332 — only while the host crashes or its crash ladder has
+                 tripped. Its tap opens the crash reports, which say what it
+                 means, so it stays a plain chip (FactChip's rule). -->
+            <v-chip
+              v-if="item.kind === 'agent' && agentFor(item) && crashChipFor(agentFor(item)!)"
+              size="x-small"
+              variant="tonal"
+              class="mt-1"
+              prepend-icon="mdi-alert-octagon-outline"
+              :color="crashChipFor(agentFor(item)!)!.color"
+              :title="crashChipFor(agentFor(item)!)!.tooltip"
+              data-testid="agent-crash-chip"
+              @click="openCrashes(agentFor(item)!)"
+            >
+              {{ crashChipFor(agentFor(item)!)!.text }}
+            </v-chip>
             <v-chip
               v-if="item.kind === 'agent' && agentFor(item) && remoteConfigChip(agentFor(item)!)"
               size="x-small"
@@ -687,6 +717,30 @@
                   >
                     {{ stallChip(agentFor(item)!)!.text }}
                   </FactChip>
+                  <!-- FR-67 P5 and #3332 — the same two markers as the table view's. -->
+                  <FactChip
+                    v-if="installChipFor(agentFor(item)!)"
+                    size="x-small"
+                    variant="tonal"
+                    prepend-icon="mdi-package-down"
+                    :color="installChipFor(agentFor(item)!)!.color"
+                    :explain="installChipFor(agentFor(item)!)!.tooltip"
+                    data-testid="agent-install-chip"
+                  >
+                    {{ installChipFor(agentFor(item)!)!.text }}
+                  </FactChip>
+                  <v-chip
+                    v-if="crashChipFor(agentFor(item)!)"
+                    size="x-small"
+                    variant="tonal"
+                    prepend-icon="mdi-alert-octagon-outline"
+                    :color="crashChipFor(agentFor(item)!)!.color"
+                    :title="crashChipFor(agentFor(item)!)!.tooltip"
+                    data-testid="agent-crash-chip"
+                    @click="openCrashes(agentFor(item)!)"
+                  >
+                    {{ crashChipFor(agentFor(item)!)!.text }}
+                  </v-chip>
                   <v-chip
                     v-if="remoteConfigChip(agentFor(item)!)"
                     size="x-small"
@@ -864,6 +918,15 @@
                       <template v-if="agentFor(item)?.peer_auth_fingerprint">
                         <dt>Device key</dt>
                         <dd class="text-mono">{{ agentFor(item)!.peer_auth_fingerprint }}</dd>
+                      </template>
+                      <!-- FR-67 P5 — the last install's verdict, a verified one
+                           too: the detail behind the marker, and on a touch
+                           screen the only place a verified one is said. -->
+                      <template v-if="agentFor(item) && installSentence(agentFor(item)!.capabilities?.last_install)">
+                        <dt>Update</dt>
+                        <dd data-testid="agent-install-sentence">
+                          {{ installSentence(agentFor(item)!.capabilities?.last_install) }}
+                        </dd>
                       </template>
                       <template v-if="agentFor(item) && codecChips(agentFor(item)!).length > 0">
                         <dt>Codecs</dt>
@@ -1076,6 +1139,7 @@
     :tenant-id="tenantId"
     :agent-id="crashesTarget?.id ?? ''"
     :agent-name="deviceLabel(crashesTarget)"
+    :health="crashSentence(crashesTarget?.capabilities?.crash_health)"
   />
 
   <!-- Logs viewer modal (centralized agent-log upload, rc.58/rc.59) -->
@@ -1462,6 +1526,7 @@ import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
 import { credentialChip } from '@/utils/credentialExpiry'
 import { updateStallChip } from '@/utils/updateStall'
+import { crashChip, crashSentence, installChip, installSentence } from '@/utils/deviceHealth'
 import { reportedVersion, versionLabel } from '@/utils/deviceVersion'
 import { refusalShort, updateRefusal } from '@/utils/updateRefusal'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
@@ -1654,6 +1719,19 @@ function stallChip(a: Agent) {
   return updateStallChip(a.agent_version, a.is_online, a.os, agentStore.releases)
 }
 
+/** FR-67 P5 — the last install's marker for a device, or `null`: the device's
+ *  own word (`capabilities.last_install`), shown beside presence and never
+ *  instead of it. */
+function installChipFor(a: Agent) {
+  return installChip(a.capabilities?.last_install)
+}
+
+/** #3332 — the crash marker for a device, or `null`: the host's crash ladder
+ *  (`capabilities.crash_health`). Its tap opens the crash reports. */
+function crashChipFor(a: Agent) {
+  return crashChip(a.capabilities?.crash_health)
+}
+
 /** FR-27 — the companion version to display, or `''` when there is nothing
  *  worth saying.
  *
@@ -1674,7 +1752,11 @@ function companionSkew(row: DeviceRow): string {
  *  a version yet, which program enrolled it. A row's version is its daemon's
  *  own, never the enrolling program's. */
 function versionTitle(row: DeviceRow): string | undefined {
-  if (reportedVersion(row.version)) return undefined
+  // FR-67 P5 — a version the daemon reported carries its last install's
+  // verdict, a verified one too, which shows no marker.
+  if (reportedVersion(row.version)) {
+    return installSentence(agentFor(row)?.capabilities?.last_install) || undefined
+  }
   const p = agentFor(row)?.enrolling_program
   const by = p ? ` Enrolled by ${p.name}${p.version ? ` ${p.version}` : ''}.` : ''
   return `Its daemon has not reported its version yet: it does once it connects.${by}`
@@ -1733,6 +1815,8 @@ function cardHasChips(row: DeviceRow): boolean {
   return !!(
     credentialChip(a.token_expires_at) ||
     stallChip(a) ||
+    installChipFor(a) ||
+    crashChipFor(a) ||
     remoteConfigChip(a) ||
     keyRotationChip(a) ||
     companionSkew(row) ||

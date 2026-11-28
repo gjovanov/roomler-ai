@@ -2738,6 +2738,8 @@ async fn connect_once(
                             // FR-157 P1 — the screen-worker word it carries.
                             gui_worker = ?c.gui_worker,
                             video_cells = c.video_cells.len(),
+                            last_install = c.last_install.as_ref().map_or("-", |w| w.status.as_str()),
+                            crash_health = c.crash_health.as_ref().map_or("-", |w| w.state.as_str()),
                             "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                         );
                         Box::new(c)
@@ -7231,6 +7233,15 @@ struct Announced {
     /// reaches the server at once. `None` in the worker and on every other
     /// platform.
     gui_worker: Option<roomler_ai_remote_control::models::GuiWorkerBrief>,
+    /// FR-67 P5 — the last install's verdict, from the refresher's cache
+    /// ([`crate::health_words`]), never a read of the record on this loop. On
+    /// Windows the first hello after an update says `InProgress`, and the
+    /// verdict landing is news on the next beat.
+    last_install: Option<roomler_ai_remote_control::models::LastInstallWord>,
+    /// #3332 — the crash ladder's state, from the same cache: the clean-run
+    /// promotion clearing a count is news on the next beat. Host-wide, so
+    /// every org's connection says the same.
+    crash_health: Option<roomler_ai_remote_control::models::CrashHealth>,
 }
 
 /// #3992 — what a connection's announcements are built from and that stays the
@@ -7276,6 +7287,9 @@ impl Announcer<'_> {
             ),
             None => (None, None, None, None),
         };
+        // FR-67 P5 / #3332 — the host's two health words, one hold of the
+        // refresher's cache, so the pair is always one read's.
+        let health = crate::health_words::current();
         Announced {
             caps_generation,
             permissions,
@@ -7306,6 +7320,8 @@ impl Announcer<'_> {
             gui_worker: self.gui_worker.clone().map(|without_host| {
                 delegate.map_or(without_host, crate::delegate::DelegateHost::gui_worker_word)
             }),
+            last_install: health.last_install,
+            crash_health: health.crash_health,
         }
     }
 
@@ -7433,6 +7449,13 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool, words: &Announced) -> AgentC
     // re-announce REPLACES the stored caps, so a hello-only word would be gone
     // at the first login.
     caps.update_mode = Some(crate::updater::update_mode(is_primary).to_string());
+    // FR-67 P5 / #3332 — the last install's verdict and the crash ladder's
+    // state, stamped here for the same reason: a beat's caps replace the row's,
+    // so a word written only into the hello would be gone at the first beat
+    // that carries caps. Both come from the refresher's cache through
+    // `Announcer::now`, never from disk on this loop.
+    caps.last_install = words.last_install.clone();
+    caps.crash_health = words.crash_health.clone();
     // `detect()` is memoized and config-blind, so the one capability that
     // depends on the host's config gets appended here: `tun` says "this
     // daemon's TUN is already muxed — a second org can join the mesh
@@ -11538,6 +11561,96 @@ mod announce_tests {
         assert!(with.gui_worker.is_some());
         assert_eq!(with.permissions, without.permissions);
         assert_eq!(with.has_input_permission, without.has_input_permission);
+    }
+
+    /// FR-67 P5 / #3332 — the two health words ride the hello, and a change in
+    /// either is news on the next beat, once. On Windows the first hello after
+    /// an update carries `InProgress`, because the verdict lands after the new
+    /// service started (`docs/update-outcome.md` §3), and the clean-run
+    /// promotion clears a crash count five minutes into a run. Each
+    /// re-announces the caps, and a beat with no change carries none. A
+    /// secondary org's loop says the same words: they are the host's.
+    #[test]
+    fn a_changed_health_word_is_news_on_the_next_beat_once() {
+        use crate::health_words::{Words, restore_after_test, set_for_test};
+        use roomler_ai_remote_control::models::{CrashHealth, LastInstallWord};
+        let _probe = crate::encode::caps::loop_fixture();
+        let _restore = restore_after_test();
+        let at_work = LastInstallWord {
+            status: LastInstallWord::IN_PROGRESS.into(),
+            never_reported: false,
+            expected_version: Some("agent-v0.4.240".into()),
+            new_binary_version: None,
+            started_unix: Some(1_795_000_000),
+            finished_unix: None,
+        };
+        let crashing = CrashHealth {
+            state: CrashHealth::CRASHING.into(),
+            crashes: 2,
+            window_secs: 600,
+            last_crash_unix: Some(1_794_999_990),
+            accused_version: None,
+            last_known_good: Some("0.4.239".into()),
+        };
+        set_for_test(Words {
+            last_install: Some(at_work.clone()),
+            crash_health: Some(crashing.clone()),
+        });
+        let announcer = primary();
+        let mut hello = announcer.hello(None);
+        assert_eq!(hello.caps.last_install.as_ref(), Some(&at_work));
+        assert_eq!(hello.caps.crash_health.as_ref(), Some(&crashing));
+        assert!(
+            announcer.beat(&mut hello.last, None).is_none(),
+            "no change, no caps"
+        );
+        let secondary = Announcer {
+            is_primary: false,
+            ..primary()
+        };
+        let other = secondary.hello(None).caps;
+        assert_eq!(other.last_install.as_ref(), Some(&at_work));
+        assert_eq!(other.crash_health.as_ref(), Some(&crashing));
+
+        // The verdict lands.
+        let verified = LastInstallWord {
+            status: LastInstallWord::SUCCEEDED_VERIFIED.into(),
+            new_binary_version: Some("0.4.240".into()),
+            finished_unix: Some(1_795_000_020),
+            ..at_work.clone()
+        };
+        set_for_test(Words {
+            last_install: Some(verified.clone()),
+            crash_health: Some(crashing.clone()),
+        });
+        let beat = announcer
+            .beat(&mut hello.last, None)
+            .expect("the verdict is news");
+        assert_eq!(beat.last_install.as_ref(), Some(&verified));
+        assert_eq!(
+            beat.crash_health.as_ref(),
+            Some(&crashing),
+            "the other word rides along: a beat's caps replace the row's"
+        );
+        assert!(announcer.beat(&mut hello.last, None).is_none(), "once");
+
+        // The clean-run promotion.
+        let ok = CrashHealth {
+            state: CrashHealth::OK.into(),
+            crashes: 0,
+            last_crash_unix: None,
+            last_known_good: Some("0.4.240".into()),
+            ..crashing.clone()
+        };
+        set_for_test(Words {
+            last_install: Some(verified.clone()),
+            crash_health: Some(ok.clone()),
+        });
+        let beat = announcer
+            .beat(&mut hello.last, None)
+            .expect("the promotion is news");
+        assert_eq!(beat.crash_health.as_ref(), Some(&ok));
+        assert!(announcer.beat(&mut hello.last, None).is_none(), "once");
     }
 }
 #[cfg(test)]
