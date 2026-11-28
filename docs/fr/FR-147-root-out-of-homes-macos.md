@@ -182,7 +182,7 @@ The child's first statements, before it reads its verb's arguments or any file:
 
 So the child can do in the home what the person's account can do as its owner, and nothing through another group.
 
-Not through `sudo -u`, the form the worker's start (`macos_supervisor.rs:1349-1388`) and the package's `as_person`
+Not through `sudo -u`, the form the worker's start (`macos_supervisor.rs:1449-1488`) and the package's `as_person`
 (`agents/roomlerd/packaging/macos/postinstall:262-264`) use: an enrollment's token and WireGuard key cross these
 pipes, `sudo` records a command's input and output where it is set to, and it can pass the caller's `HOME` on.
 
@@ -205,7 +205,7 @@ with "nothing has changed" (exit 1).
 | # | State, from the child's `read` | What is printed |
 |---|---|---|
 | R1 | `<L>` is not writable by the person, and the plan removes `<P>` (#3763) | the administrator's line where it fits (below), else the no-command text |
-| R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:641-766`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1064`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
+| R2 | `<F>` is not the person's, and the plan blanks its config (#3802) | #3846's administrator's command where the package's rule fits (`move_aside`, `macos_supervisor.rs:741-866`: a `sudo mv` of `<F>` aside, then a restart), built from the child's report (`folder_not_theirs`, `:1164`), else its words without a command. No command the person runs can move `<F>`: macOS lets no account rename a directory another account owns. Whether anything replaces it is D8 |
 | R3 | the config exists and the person cannot read it (a copy of root's, mode 600) | the administrator's line for that file where it fits, else the no-command text |
 | R4 | the console person's `<F>` exists and is not theirs, though no blank is planned (the #3802 state) | as R2: an administrator's command or words, never one for the person. Without R4 the worker's first save (`app.rs:4144`) fails after the restart, and the conversion undoes itself |
 | R5 | the console person has `com.roomler.agent` loaded but is not a person to convert | no command; it says why that person was left alone (the verify would fail after the restart) |
@@ -220,7 +220,7 @@ hold (the package's `sudo_line_fits`, `postinstall:285-291`, and its owner test,
    of the person's, not a link.
 4. The child reports that the target is a folder (R1) or a regular file (R3) of uid 0, not a link.
 
-The line, each word quoted by `sh_quote` (`macos_supervisor.rs:980-982`):
+The line, each word quoted by `sh_quote` (`macos_supervisor.rs:1080-1082`):
 
     <name> is an administrator of this Mac and can run this, then run `sudo roomlerd one-row` again:
       sudo chown -h '<name>' '<path>'
@@ -231,14 +231,14 @@ The no-command text, for R1 and R3 when a condition fails:
       It has to be <name>'s own before `sudo roomlerd one-row` can make this Mac one row;
       see docs/installation.md, section "Which account each step of the package's script writes as".
 
-That section is `docs/installation.md:3320`; P1 adds one-row's row to it. The lines are `chown_words`
+That section is `docs/installation.md:3324`; P1 adds one-row's row to it. The lines are `chown_words`
 (`one_row.rs:1010`) and `folder_words` (`:1143`), with `r5_words` (`:1189`); `refusals` (`:1623`) says them.
 
 ### Refusals at Plan
 
 An ephemeral row ([FR-51](../ephemeral-nodes.md)) is refused before anything changes (#4312, ruled 2026-11-23).
 One-row stops the half that holds it, the root half at its restart and a person's at the bootout, and on such a
-stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5942-6009`, by
+stop an ephemeral row deletes itself (`agents/roomlerd/src/app.rs:5950-6017`, by
 `updater::should_self_unenroll`, `agents/roomlerd/src/updater.rs:458-464`). One-row does not mark its own stops,
 as the updater's `update-attempt` marker does (#1683): a retired row stays offline for as long as the Mac stays
 one row, and the server's reaper deletes an offline ephemeral row however it stopped.
@@ -249,7 +249,7 @@ one row, and the server's reaper deletes an offline ephemeral row however it sto
 | A person's primary that the root half does not hold | move it, though it lives only with the half that enrolled it. Refused before #4312 too | the same |
 | The root half's primary | stop the daemon that holds it, at the restart and again at the undo's | `migrate` (`one_row.rs:1873-1875`), with `ephemeral_root` (`:727`), once the plan has something to do. A Mac that is one row already restarts nothing and still reads "nothing to do" (`:1861-1869`) |
 | Root's file that `--revert` restarts onto | stop the daemon at that restart, whose stop reads root's file as it is by then, the one put back | `revert_main` (`one_row.rs:3298-3300`), with `ephemeral_revert` (`:3240`): root's kept copy where there is one, since it goes back first, else root's own file |
-| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1988-2046`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:958-988`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5990`) |
+| An `[[orgs]]` entry, a person's or the root's | nothing new | not refused. An entry has no `ephemeral` (`OrgEntry`, `crates/agent-core/src/config.rs:1988-2046`), an enrollment appended as one is built without it (`crates/agent-core/src/enrollment.rs:958-988`), and the stop deletes only the primary's row (`agents/roomlerd/src/app.rs:5998`) |
 
 Each comes before Keep, so no file is written and launchd is asked nothing, and `--dry-run` refuses the same way.
 A person's line comes from the pure `plan`, before the plan is said. The root half's comes after it, beside R1 to R5,
@@ -263,7 +263,7 @@ first because a live ephemeral row stays ephemeral when a standard token enrolls
 `one_row.rs:723`; [`ephemeral-nodes.md`](../ephemeral-nodes.md#enrolling-again-over-an-existing-config-4331)). Until
 #4331 the way on was a new config, since a fold kept the old file's flag. The line before #4312 also offered
 "unenroll it first" and "enroll the root half there", and neither gets past it: no command takes an enrollment out
-of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:6011-6014`), and an org
+of a file, the stop's self-unenroll leaves its file as it was (`agents/roomlerd/src/app.rs:6019-6022`), and an org
 the root half holds is refused too.
 
 | Case | The line, after `Error: ` (exit 1) |
@@ -301,7 +301,7 @@ root, as their `config.toml.prev`, and a load of the person's config restores it
 not load. Two changes close that, both inside this FR's rule: root does nothing inside a home.
 
 **The sweep.** The root daemon (macOS, euid 0, not a `--supervised` worker) starts one task beside the
-supervisor's (`agents/roomlerd/src/app.rs:5358`, aborted at teardown with the others, `:5913`), `sweep_at_start`
+supervisor's (`agents/roomlerd/src/app.rs:5366`, aborted at teardown with the others, `:5921`), `sweep_at_start`
 (`agents/roomlerd/src/one_row.rs:3711`). Once the daemon has run `CLEAN_RUN_THRESHOLD_SECS` (5 min, as
 the clean-run promotion does), it looks in its own tree: with no conversion's records (root's kept copy,
 `root.json`, a uid's folder) it stops there and says nothing. Otherwise it reads root's file, with no restore and
@@ -337,7 +337,7 @@ load (`config_at_start::load`, `agents/roomlerd/src/app/config_at_start.rs:121`,
 (#4157). It ends with 78 and the line `the config at <path> does not load (<why>), and this worker does not restore
 its last good copy: …` (`ConfigDoesNotLoad`, `agents/roomlerd/src/daemon_error.rs:113`), both files as they
 were. The supervisor records no crash for it, and its give-up after exit 78 names both ends (`gave_up_reason`,
-`agents/roomlerd/src/macos_supervisor.rs:575-583`). Every other start restores as before, the unenrolled screen
+`agents/roomlerd/src/macos_supervisor.rs:675-683`). Every other start restores as before, the unenrolled screen
 worker's among them.
 
 ```mermaid
@@ -612,7 +612,7 @@ folder is not theirs: before it starts the screen worker, not after five fast ex
   rename `<F>` to `<F>.made-by-root-<stamp>`, rename `<F>.new-<stamp>` to `<F>`. The old copies' bytes go to root as
   records, so nothing of `one-row`'s stays in the home. The root-made folder stays beside it, as a named leftover
   that the person cannot delete.
-- The supervisor's own `lstat` of the folder (`person_folder_not_theirs`, `macos_supervisor.rs:1199-1206`) moves into
+- The supervisor's own `lstat` of the folder (`person_folder_not_theirs`, `macos_supervisor.rs:1299-1306`) moves into
   the verb's checks, so root reads nothing in the home.
 - P2 replaces the printed line, not the give-up's cause text, and it ships behind a switch whose off state is today's
   give-up with the printed line (since #3846, the administrator's command). It needs supervisor wiring and lab cells
@@ -633,7 +633,7 @@ or removal is its own issue and pull request, designed there; P1 does not touch 
 | `scripts/install.sh:1115` | `as_root grep` of the console person's `config.toml` | read |
 | `postinstall:145-163`, `:445`, `:530` | root's `launchctl bootstrap gui/<uid> <P>`: launchd opens a path in the home | read by launchd (D6) |
 | `postinstall:287-290`, `:326` | root's tests and `stat` of the console home, its `Library` and `<L>` (the writes are the person's) | read |
-| `macos_supervisor.rs:1199-1206` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
+| `macos_supervisor.rs:1299-1306` | root's `lstat` of the console person's folder | read; P2 moves it into the child |
 | `agents/roomlerd/src/files.rs:220-235` (`process_home`) | `BaseDirs`, from `$HOME`: typed as `sudo roomlerd run`, the daemon's active home is the caller's, not root's `/var/root` | read |
 | `agents/roomlerd/src/files.rs:5492-5502` (`default_download_dir`) | `UserDirs`, from `$HOME`: typed as `sudo roomlerd run`, it names the caller's `~/Downloads` as the folder a received file goes to | write |
 | `agents/roomlerd/src/recording/folder.rs:160-179` (`default_choice`) | `BaseDirs` and `UserDirs`, from `$HOME`: typed as `sudo roomlerd record` (a hidden command, `app.rs:528-529`), it names the caller's Movies folder and makes it when missing (`create_dir_all`, `:265`) | write |
@@ -727,7 +727,7 @@ where macOS does not. Cell C8 reads it.
 
 The docs:
 
-- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3033`, its sequence at `:3087`): the
+- `docs/installation.md`, "The migration (FR-43 P3c)" (`docs/installation.md:3037`, its sequence at `:3091`): the
   person's child, root's records, the refusals and the revert of older Macs, with the conversion as a mermaid
   sequence.
 - `docs/installation.md`, "Which account each step of the package's script writes as" (`:3320`): one-row's row, and
